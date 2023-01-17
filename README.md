@@ -73,7 +73,7 @@ Posiada ona następujące metody:
 - `getMenu` -- zwracająca wektor nazw produktów dostępnych w menu. Po zamknięciu systemu zwraca pusty wektor.
 - `getPendingOrders` -- zwracająca wektor numerów zamówień, które, nie zostały jeszcze odebrane przez klienta, nie upłynął dla nich czas oczekiwania ani nie uległa awarii żadna maszyna, na którą oczekiwał realizujący je pracownik.
 - `order` -- przyjmująca wektor nazw produktów zamawianych przez klienta i zwracająca `unique_ptr pager`, który klient może użyć do odbioru zamówienia. W przypadku gdy została już wywołana metoda `shutdown`, podniesiony jest wyjątek `RestaurantClosedException`, natomiast gdy klient zamawia produkt, który nie jest dostępny w menu, podniesiony jest wyjątek `BadOrderException`.
-- `collectOrder` -- przyjmująca `unique_ptr` na `pager` i zwracająca wektor produktów zamówionych przez klienta. Podnosi ona następujące wyjątki: 
+- `collectOrder` -- przyjmująca `unique_ptr` na `pager` i zwracająca wektor produktów zamówionych przez klienta. Podnosi ona następujące wyjątki:
 
 	1.`FulfillmentFailure` -- w przypadku gdy jedna z potrzebnych do realizacji zamówienia maszyn zepsuła się przed odebraniem produktu przez pracownika realizującego zamówienie.
 	2.`OrderNotReadyException` -- w przypadku gdy zamówienie nie jest jeszcze gotowe (ale może jeszcze zostać zrealizowane).
@@ -128,8 +128,9 @@ Plik `system.hpp` można dowolnie modyfikować, nie zmieniając jednak publiczny
 
 ## Pytania
 Pytania prosimy zadawać na forum.
-[demo.cpp]()
-[demo.cpp]()
-[system.cpp]()
-[system.hpp]()
 
+### Dostarczone pliki
+- [demo.cpp](demo.cpp)
+- [demo.hpp](demo.hpp)
+- [system.cpp](system.cpp)
+- [system.hpp](system.hpp)
