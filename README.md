@@ -47,7 +47,7 @@ Maszyny są instancjami podklas klasy Machine. Klasa `Machine` implementuje meto
 
 Metody klasy `Machine` nie gwarantują bezpieczeństwa.
 Nie ma dwóch maszyn produkujących ten sam typ produktu.
-Raz zepsuta maszyna, zawsze będzie już podnosić wyjątek przy wołaniu `getProduct.
+Raz zepsuta maszyna, zawsze będzie już podnosić wyjątek przy wołaniu `getProduct`.
 
 Raport pracownika jest strukturą zawierającą następujące pola:
 
@@ -75,10 +75,14 @@ Posiada ona następujące metody:
 - `order` -- przyjmująca wektor nazw produktów zamawianych przez klienta i zwracająca `unique_ptr pager`, który klient może użyć do odbioru zamówienia. W przypadku gdy została już wywołana metoda `shutdown`, podniesiony jest wyjątek `RestaurantClosedException`, natomiast gdy klient zamawia produkt, który nie jest dostępny w menu, podniesiony jest wyjątek `BadOrderException`.
 - `collectOrder` -- przyjmująca `unique_ptr` na `pager` i zwracająca wektor produktów zamówionych przez klienta. Podnosi ona następujące wyjątki:
 
-	1.`FulfillmentFailure` -- w przypadku gdy jedna z potrzebnych do realizacji zamówienia maszyn zepsuła się przed odebraniem produktu przez pracownika realizującego zamówienie.
-	2.`OrderNotReadyException` -- w przypadku gdy zamówienie nie jest jeszcze gotowe (ale może jeszcze zostać zrealizowane).
-	3.`OrderExpiredException` -- w przypadku gdy zamówienie nie zostało odebrane przez klienta w czasie `clientTimeout`.
-	4.`BadPagerException` -- w każdym innym przypadku gdy zamówienie nie może zostać przekazane klientowi (np. ktoś odebrał już nasze zamówienie, numer zamówienia nigdy nie wystąpił w systemie).
+	1. `FulfillmentFailure` -- w przypadku gdy jedna z potrzebnych do realizacji zamówienia 
+	   maszyn zepsuła się przed odebraniem produktu przez pracownika realizującego zamówienie.
+	2. `OrderNotReadyException` -- w przypadku gdy zamówienie nie jest jeszcze gotowe (ale może 
+	   jeszcze zostać zrealizowane).
+	3. `OrderExpiredException` -- w przypadku gdy zamówienie nie zostało odebrane przez klienta 
+	   w czasie `clientTimeout`.
+	4. `BadPagerException` -- w każdym innym przypadku gdy zamówienie nie może zostać przekazane 
+	   klientowi (np. ktoś odebrał już nasze zamówienie, numer zamówienia nigdy nie wystąpił w systemie).
 
 - `getClientTimeout` -- zwracająca czas, po jakim gotowe, nieodebrane zamówienie może już nie zostać wydane.
 
