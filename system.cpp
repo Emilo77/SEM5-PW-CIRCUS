@@ -30,24 +30,25 @@ System::System(machines_t machines,
     }
 
     for (unsigned int i = 0; i < numberOfWorkers; i++) {
-        workers.emplace({i, Worker(i)});
+        workers.emplace_back([this]() { startWorking(); });
     }
-
-
-    //todo stworzenie wątku dla każdego pracownika
 }
+
 
 std::vector<WorkerReport> System::shutdown() {
     closed = true;
 
-    //todo czekanie, aż pracownicy dokończą pozostałe zamówienia
-
-    std::vector<WorkerReport> dailyReport;
+    for (auto &w: workers) {
+        if (w.joinable()) {
+            w.join();
+        }
+    }
 
     closeMachines();
+    std::vector<WorkerReport> dailyReport;
 
-    for (auto &w: workers) {
-        dailyReport.push_back(w.second.getReport());
+    for (auto &r: reports) {
+        dailyReport.push_back(r);
     }
 
     return dailyReport;
@@ -55,7 +56,15 @@ std::vector<WorkerReport> System::shutdown() {
 
 
 std::vector<unsigned int> System::getPendingOrders() const {
-    return std::vector<unsigned int>();
+    std::chrono::system_clock::time_point now
+            = std::chrono::system_clock::now();
+    std::vector<unsigned int> pendingOrders;
+    for (auto order: orders) {
+        if (order.pendingId(now).has_value()) {
+            pendingOrders.push_back(order.getId());
+        }
+    }
+    return pendingOrders;
 }
 
 
@@ -85,6 +94,12 @@ bool System::productsInMenu(std::vector<std::string> &products) {
     return std::ranges::all_of(products.begin(),
                                products.end(),
                                [this](std::string &product) { return menu.contains(product); });
+}
+
+void System::startWorking() {
+    while (!closed) {
+
+    }
 }
 
 

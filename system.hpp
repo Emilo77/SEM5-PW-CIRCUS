@@ -8,6 +8,8 @@
 #include <future>
 #include <iostream>
 #include <set>
+#include <deque>
+#include <optional>
 
 #include "machine.hpp"
 
@@ -15,6 +17,67 @@ enum MachineStatus {
     OFF,
     ON,
     BROKEN
+};
+
+// todo sprawdzic , czy działa
+template<typename T>
+class BlockingQueue {
+private:
+    std::mutex d_mutex;
+    std::condition_variable d_condition;
+    std::deque<T> d_queue;
+public:
+    void push(T const &value) {
+        {
+            std::unique_lock<std::mutex> lock(this->d_mutex);
+            d_queue.push_front(value);
+        }
+        this->d_condition.notify_one();
+    }
+
+    T pop() {
+        std::unique_lock<std::mutex> lock(this->d_mutex);
+        this->d_condition.wait(lock, [=] { return !this->d_queue.empty(); });
+        T rc(std::move(this->d_queue.back()));
+        this->d_queue.pop_back();
+        return rc;
+    }
+};
+
+class Order {
+    enum OrderStatus {
+        NOT_DONE,
+        READY,
+        INVALID
+    };
+private:
+    unsigned int id;
+    std::chrono::time_point<std::chrono::system_clock> time;
+    OrderStatus status;
+    unsigned int timeout;
+public:
+    explicit Order(unsigned int id, unsigned int timeout) :
+            id(id),
+            status(NOT_DONE),
+            timeout(timeout) {}
+
+    void markDone() {
+        time = std::chrono::system_clock::now();
+        status = READY;
+    }
+
+    unsigned int getId() const {
+        return id;
+    }
+
+    std::optional<unsigned int> pendingId(std::chrono::time_point<std::chrono::system_clock>
+            currentTime) {
+        std::chrono::duration<double> elapsedTime = currentTime - time;
+        if (status == READY && elapsedTime <= std::chrono::milliseconds(timeout)) {
+            return id;
+        }
+        return {};
+    }
 };
 
 class FulfillmentFailure : public std::exception {
@@ -42,31 +105,6 @@ struct WorkerReport {
     std::vector<std::string> failedProducts;
 };
 
-class Worker {
-private:
-    WorkerReport dailyReport;
-    unsigned int id;
-    std::thread thread;
-public:
-    Worker(unsigned int id)
-            : id(id) {
-        thread = std::thread{[this] { this->startWorking(); }};
-    }
-
-    void startWorking() {
-        std::cout << "worker " << id << " started.\n";
-    }
-
-    WorkerReport getReport() { return dailyReport; }
-
-    ~Worker() {
-        if (thread.joinable()) {
-            thread.join();
-        }
-    }
-
-};
-
 class CoasterPager {
 private:
     unsigned int currentId;
@@ -89,8 +127,11 @@ private:
     std::atomic_bool closed;
     machines_t machines;
     std::set<std::string> menu;
-    std::unordered_map<unsigned int, Worker> workers;
+    std::set<Order> orders;
     std::unordered_map<std::string, MachineStatus> machineStatus;
+
+    std::vector<std::thread> workers;
+    std::vector<struct WorkerReport> reports;
 
     std::mutex shutdown_mutex;
 
@@ -119,6 +160,8 @@ public:
     void initializeMachines(machines_t &machines);
 
     void closeMachines();
+
+    void startWorking();
 };
 
 
