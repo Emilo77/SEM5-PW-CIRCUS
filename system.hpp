@@ -10,6 +10,7 @@
 #include <set>
 #include <deque>
 #include <optional>
+#include <map>
 
 #include "machine.hpp"
 
@@ -19,15 +20,15 @@ enum MachineStatus {
     BROKEN
 };
 
-// todo sprawdzic , czy działa
+
 template<typename T>
-class BlockingQueue {
+class OrderQueue {
 private:
     std::mutex d_mutex;
     std::condition_variable d_condition;
     std::deque<T> d_queue;
 public:
-    void push(T const &value) {
+    void pushOrder(T const &value) {
         {
             std::unique_lock<std::mutex> lock(this->d_mutex);
             d_queue.push_front(value);
@@ -35,48 +36,15 @@ public:
         this->d_condition.notify_one();
     }
 
-    T pop() {
+    T popOrder() {
         std::unique_lock<std::mutex> lock(this->d_mutex);
         this->d_condition.wait(lock, [=] { return !this->d_queue.empty(); });
-        T rc(std::move(this->d_queue.back()));
+        T order(std::move(this->d_queue.back()));
         this->d_queue.pop_back();
-        return rc;
-    }
-};
 
-class Order {
-    enum OrderStatus {
-        NOT_DONE,
-        READY,
-        INVALID
-    };
-private:
-    unsigned int id;
-    std::chrono::time_point<std::chrono::system_clock> time;
-    OrderStatus status;
-    unsigned int timeout;
-public:
-    explicit Order(unsigned int id, unsigned int timeout) :
-            id(id),
-            status(NOT_DONE),
-            timeout(timeout) {}
+        // uzupełnienie wszystkich kolejek, do których trzeba wrzucić zamówienie
 
-    void markDone() {
-        time = std::chrono::system_clock::now();
-        status = READY;
-    }
-
-    unsigned int getId() const {
-        return id;
-    }
-
-    std::optional<unsigned int> pendingId(std::chrono::time_point<std::chrono::system_clock>
-            currentTime) {
-        std::chrono::duration<double> elapsedTime = currentTime - time;
-        if (status == READY && elapsedTime <= std::chrono::milliseconds(timeout)) {
-            return id;
-        }
-        return {};
+        return order;
     }
 };
 
@@ -105,30 +73,134 @@ struct WorkerReport {
     std::vector<std::string> failedProducts;
 };
 
+class Order {
+    enum OrderStatus {
+        NOT_DONE,
+        READY,
+        INVALID
+    };
+private:
+    size_t id;
+    std::chrono::time_point<std::chrono::system_clock> doneTime;
+    OrderStatus status;
+    unsigned int timeout;
+    vector <std::string> products;
+public:
+    explicit Order(unsigned int id, unsigned int timeout) :
+            id(id),
+            status(NOT_DONE),
+            timeout(timeout) {}
+
+    void markDone() {
+        doneTime = std::chrono::system_clock::now();
+        status = READY;
+    }
+
+    [[nodiscard]] size_t getId() const {
+        return id;
+    }
+
+    [[nodiscard]] vector <std::string> getProducts() const {
+        return products;
+    }
+
+    [[nodiscard]] bool isReady() const {
+        return status == READY;
+    }
+
+    std::optional<unsigned int> pendingId(std::chrono::time_point<std::chrono::system_clock>
+                                          currentTime) {
+        std::chrono::duration<double> elapsedTime = currentTime - doneTime;
+        if (status == READY && elapsedTime <= std::chrono::milliseconds(timeout)) {
+            return id;
+        }
+        return {};
+    }
+};
+
+class MachinesSynchronizer {
+private:
+    std::unordered_map<std::string, std::deque<unsigned int>> ques;
+    std::mutex mutex;
+public:
+    void initialize(const std::unordered_map<std::string,
+            std::shared_ptr<Machine>> &machines) {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (auto &machine: machines) {
+            ques.emplace(machine.first, std::deque<unsigned int>());
+        }
+    }
+
+    void insertOrder(Order &order) {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (const auto &product: order.getProducts()) {
+            if (ques.count(product))
+                ques.at(product).push_front(order.getId());
+            else {
+                cout << "insertOrder: product "
+                     << product << " not found in any machine\n";
+                exit(1);
+            }
+        }
+    }
+
+    void popProduct(const std::string &product) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (ques.count(product))
+            ques.at(product).pop_back();
+        else {
+            cout << "popProduct: product "
+                 << product << " not found in any machine\n";
+            exit(1);
+        }
+    }
+};
+
+
 class CoasterPager {
 private:
-    unsigned int currentId;
+    size_t currentId;
+    Order order;
 public:
+    CoasterPager(size_t id, Order &order) :
+            currentId(id),
+            order(order) {}
+
     void wait() const;
 
     void wait(unsigned int timeout) const;
 
     [[nodiscard]] unsigned int getId() const { return currentId; };
 
-    [[nodiscard]] bool isReady() const;
+    [[nodiscard]] bool isReady() const { return order.isReady(); };
 };
 
 class System {
+private:
+    class IdGenerator {
+        size_t id{1};
+    public:
+        size_t newId() { return id++; }
+    };
+
 public:
     typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
 private:
     unsigned int numberOfWorkers;
     unsigned int clientTimeout;
-    std::atomic_bool closed;
-    machines_t machines;
-    std::set<std::string> menu;
+
+    IdGenerator idGenerator;
     std::set<Order> orders;
+    std::map<size_t, CoasterPager> pagers;
+
+    std::atomic_bool closed;
+
+    std::set<std::string> menu;
+    std::mutex menuMutex;
+
+    machines_t machines;
     std::unordered_map<std::string, MachineStatus> machineStatus;
+    MachinesSynchronizer mSynchronizer;
 
     std::vector<std::thread> workers;
     std::vector<struct WorkerReport> reports;

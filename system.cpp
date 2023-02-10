@@ -5,6 +5,7 @@ void System::initializeMachines(machines_t &m) {
     for (auto &machine: m) {
         machineStatus.emplace(machine.first, MachineStatus::OFF);
     }
+    mSynchronizer.initialize(m);
 }
 
 
@@ -77,7 +78,7 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
         throw BadOrderException();
     }
 
-
+    mSynchronizer.insertOrder(idGenerator.newId(), products);
     //stworzenie pagera i zwrócenie go
 
     return std::unique_ptr<CoasterPager>();
@@ -91,6 +92,7 @@ System::collectOrder(std::unique_ptr<CoasterPager> CoasterPager) {
 
 
 bool System::productsInMenu(std::vector<std::string> &products) {
+    std::unique_lock<std::mutex> lock(menuMutex);
     return std::ranges::all_of(products.begin(),
                                products.end(),
                                [this](std::string &product) { return menu.contains(product); });
@@ -109,10 +111,5 @@ void CoasterPager::wait() const {
 
 
 void CoasterPager::wait(unsigned int timeout) const {
-    sleep(timeout);
-}
 
-
-bool CoasterPager::isReady() const {
-    return false;
 }
