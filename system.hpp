@@ -123,7 +123,7 @@ public:
     }
 };
 
-class MachinesSynchronizer;
+class OrderSynchronizer;
 
 
 template<typename T>
@@ -135,7 +135,7 @@ private:
 public:
     void push(T const &value);
 
-    T popOrder(MachinesSynchronizer &sync);
+    T popOrderFromClient(OrderSynchronizer &sync);
 
     T pop();
 };
@@ -144,7 +144,7 @@ class MachineWrapper {
     std::string machineName;
     std::shared_ptr<Machine> machine;
     BlockingQueue<std::promise<unique_ptr < Product>>>
-    orderQueue;
+    machineQueue;
     std::thread thread;
     atomic_bool &systemOpen;
 public:
@@ -156,11 +156,16 @@ public:
             systemOpen(systemOpen) {
         thread = std::thread([this] { machineWorker(); });
     }
+
+    void insertToQueue(std::promise<unique_ptr < Product>> &promise) {
+        machineQueue.push(promise);
+    }
+
 private:
     void machineWorker() {
         while (!systemOpen) {
             std::promise<unique_ptr < Product>>
-            promise = orderQueue.pop();
+            promise = machineQueue.pop();
             try {
                 auto product = machine->getProduct();
                 promise.set_value(std::move(product));
@@ -172,8 +177,36 @@ private:
     }
 };
 
-class MachinesSynchronizer {
+class OrderSynchronizer {
+private:
+    std::condition_variable condition;
+    std::mutex mutex;
 
+public:
+
+    std::vector<std::future<unique_ptr < Product>>>
+    insertOrderToMachines(Order
+    &order,
+    std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> &machines
+    ) {
+
+        std::unique_lock<std::mutex> lock(mutex);
+
+        std::vector<std::future<unique_ptr<Product>>> futures;
+        for (const auto &productName: order.getProducts()) {
+
+            std::promise<unique_ptr <Product>>
+            newPromise;
+            std::future<unique_ptr < Product>>
+            newFuture
+                    = newPromise.get_future();
+
+            machines.at(productName)->insertToQueue(newPromise);
+            futures.push_back(std::move(newFuture));
+        }
+        return futures;
+    }
 };
 
 class CoasterPager {
@@ -214,6 +247,7 @@ private:
     unsigned int clientTimeout;
     std::atomic_bool systemOpen;
 
+    OrderSynchronizer orderSynchronizer;
     std::map<size_t, Order> orders;
     BlockingQueue<Order> orderQueue;
     std::map<size_t, CoasterPager> pagers;
@@ -222,7 +256,6 @@ private:
     std::mutex menuMutex;
 
     machineWrappers_t machines;
-//    MachinesSynchronizer mSynchronizer;
 
     std::vector<std::thread> orderWorkers;
     std::vector<struct WorkerReport> workerReports;

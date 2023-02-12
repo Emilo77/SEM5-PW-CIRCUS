@@ -11,13 +11,13 @@ void BlockingQueue<T>::push(T const &value) {
 }
 
 template<typename T>
-T BlockingQueue<T>::popOrder(MachinesSynchronizer &sync) {
+T BlockingQueue<T>::popOrderFromClient(OrderSynchronizer &sync) {
     std::unique_lock<std::mutex> lock(d_mutex);
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
     T order(std::move(d_queue.back()));
     d_queue.pop_back();
 
-    sync.insertOrder(order);
+    sync.insertOrderToMachines(order);
 
     return order;
 }
@@ -53,6 +53,7 @@ System::System(machines_t machines,
                                        machine.first,
                                        machine.second,
                                        systemOpen));
+
     }
 
     for (auto &machine: machines) {
@@ -174,6 +175,7 @@ void CoasterPager::wait(unsigned int timeout) const {
 
 void System::orderWorker() {
     while (!systemOpen) {
+        Order order = orderQueue.popOrderFromClient(orderSynchronizer);
 
     }
 }
@@ -181,4 +183,3 @@ void System::orderWorker() {
 void System::machineWorker() {
 
 }
-
