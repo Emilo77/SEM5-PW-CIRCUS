@@ -54,44 +54,46 @@ public:
         READY,
         RECEIVED,
         EXPIRED,
-        NOT_FOUND
+        OTHER
     };
 private:
     size_t id;
-    vector <std::string> products;
     unsigned int timeout;
+
+    vector <std::string> products;
+
     OrderStatus status;
-    std::mutex &mutex;
     std::chrono::time_point<std::chrono::system_clock> doneTime;
+    std::mutex &orderInfoMutex;
 public:
     explicit Order(unsigned int id,
                    vector <std::string> &products,
                    unsigned int timeout,
                    std::mutex &mutex) :
             id(id),
-            products(products),
             timeout(timeout),
+            products(products),
             status(NOT_DONE),
-            mutex(mutex) {}
+            orderInfoMutex(mutex) {}
 
     void markDone() {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         doneTime = std::chrono::system_clock::now();
         status = READY;
     }
 
     [[nodiscard]] size_t getId() const {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         return id;
     }
 
     [[nodiscard]] vector <std::string> getProducts() const {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         return products;
     }
 
     [[nodiscard]] bool isReady() const {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         return status == READY;
     }
 
@@ -106,7 +108,7 @@ public:
     }
 
     bool checkIfPending() {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         checkIfExpired();
 
         if (status == READY) {
@@ -116,7 +118,7 @@ public:
     }
 
     OrderStatus getStatus() {
-        std::unique_lock<std::mutex> lock(mutex);
+        std::unique_lock<std::mutex> lock(orderInfoMutex);
         checkIfExpired();
 
         return status;
@@ -124,29 +126,37 @@ public:
 };
 
 class OrderSynchronizer;
-
+class MachineWrapper;
 
 template<typename T>
 class BlockingQueue {
 private:
+    typedef std::future<std::unique_ptr<Product>> product_future_t;
     std::mutex d_mutex;
     std::condition_variable d_condition;
     std::deque<T> d_queue;
 public:
     void push(T const &value);
 
-    T popOrderFromClient(OrderSynchronizer &sync);
+    std::pair<Order, std::vector<product_future_t>>
+    manageOrder(OrderSynchronizer &sync, std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> &machines);
 
     T pop();
+
+    void block() { d_mutex.lock(); }
+
+    void unblock() { d_mutex.unlock(); }
 };
 
 class MachineWrapper {
     std::string machineName;
     std::shared_ptr<Machine> machine;
-    BlockingQueue<std::promise<unique_ptr < Product>>>
-    machineQueue;
+    BlockingQueue<std::promise<std::unique_ptr<Product>>>
+            machineQueue;
     std::thread thread;
     atomic_bool &systemOpen;
+    std::mutex returnProductMutex;
 public:
     MachineWrapper(std::string machineName,
                    std::shared_ptr<Machine> &machine,
@@ -157,12 +167,19 @@ public:
         thread = std::thread([this] { machineWorker(); });
     }
 
-    void insertToQueue(std::promise<unique_ptr < Product>> &promise) {
+    void insertToQueue(std::promise<std::unique_ptr<Product>> &promise) {
         machineQueue.push(promise);
+    }
+
+    //todo może usunąć referncję
+    void returnProduct(std::unique_ptr<Product> &product) {
+        std::unique_lock<std::mutex> lock(returnProductMutex);
+        machine->returnProduct(std::move(product));
     }
 
 private:
     void machineWorker() {
+        // todo: sytuacja, w której wątek czeka na kolejce, a system zamyka się
         while (!systemOpen) {
             std::promise<unique_ptr < Product>>
             promise = machineQueue.pop();
@@ -179,28 +196,25 @@ private:
 
 class OrderSynchronizer {
 private:
+    typedef std::promise<std::unique_ptr<Product>> product_promise_t;
+    typedef std::future<std::unique_ptr<Product>> product_future_t;
+
     std::condition_variable condition;
     std::mutex mutex;
 
 public:
-
-    std::vector<std::future<unique_ptr < Product>>>
-    insertOrderToMachines(Order
-    &order,
-    std::unordered_map<std::string,
-            std::shared_ptr<MachineWrapper>> &machines
-    ) {
+    std::vector<product_future_t>
+    insertOrderToMachines(Order &order,
+                          std::unordered_map<std::string,
+                                  std::shared_ptr<MachineWrapper>> &machines) {
 
         std::unique_lock<std::mutex> lock(mutex);
 
-        std::vector<std::future<unique_ptr<Product>>> futures;
+        std::vector<product_future_t> futures;
         for (const auto &productName: order.getProducts()) {
 
-            std::promise<unique_ptr <Product>>
-            newPromise;
-            std::future<unique_ptr < Product>>
-            newFuture
-                    = newPromise.get_future();
+            product_promise_t newPromise;
+            product_future_t newFuture = newPromise.get_future();
 
             machines.at(productName)->insertToQueue(newPromise);
             futures.push_back(std::move(newFuture));

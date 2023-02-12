@@ -1,6 +1,8 @@
 #include <algorithm>
 #include "system.hpp"
 
+typedef std::future<std::unique_ptr<Product>> product_future_t;
+
 template<typename T>
 void BlockingQueue<T>::push(T const &value) {
     {
@@ -11,15 +13,18 @@ void BlockingQueue<T>::push(T const &value) {
 }
 
 template<typename T>
-T BlockingQueue<T>::popOrderFromClient(OrderSynchronizer &sync) {
+std::pair<Order, std::vector<product_future_t>>
+BlockingQueue<T>::manageOrder(OrderSynchronizer &sync,
+                                std::unordered_map<std::string,
+        std::shared_ptr<MachineWrapper>> &machines) {
     std::unique_lock<std::mutex> lock(d_mutex);
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
-    T order(std::move(d_queue.back()));
+    Order order(std::move(d_queue.back()));
     d_queue.pop_back();
 
-    sync.insertOrderToMachines(order);
+    auto futures = sync.insertOrderToMachines(order, machines);
 
-    return order;
+    return std::make_pair(order, futures);
 }
 
 template<typename T>
@@ -175,11 +180,13 @@ void CoasterPager::wait(unsigned int timeout) const {
 
 void System::orderWorker() {
     while (!systemOpen) {
-        Order order = orderQueue.popOrderFromClient(orderSynchronizer);
-
+        auto orderAndFutures = orderQueue.manageOrder(orderSynchronizer, machines);
+        Order order = orderAndFutures.first;
+        auto futures = orderAndFutures.second;
     }
 }
 
 void System::machineWorker() {
 
 }
+
