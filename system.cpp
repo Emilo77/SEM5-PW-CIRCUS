@@ -1,46 +1,57 @@
 #include <algorithm>
 #include "system.hpp"
 
+typedef std::promise<std::unique_ptr<Product>> product_promise_t;
 typedef std::future<std::unique_ptr<Product>> product_future_t;
 
-template<typename T>
-void BlockingQueue<T>::push(T const &value) {
+void OrderQueue::pushOrder(Order &value) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_front(value);
+        d_queue.push_front(std::move(value));
     }
     d_condition.notify_one();
 }
 
-template<typename T>
 std::pair<Order, std::vector<product_future_t>>
-BlockingQueue<T>::manageOrder(OrderSynchronizer &sync,
-                                std::unordered_map<std::string,
-        std::shared_ptr<MachineWrapper>> &machines) {
+OrderQueue::manageOrder(OrderSynchronizer &sync,
+                             std::unordered_map<std::string,
+                                     std::shared_ptr<MachineWrapper>> &machines) {
+
     std::unique_lock<std::mutex> lock(d_mutex);
+
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
-    Order order(std::move(d_queue.back()));
+    Order order(d_queue.back());
     d_queue.pop_back();
 
     auto futures = sync.insertOrderToMachines(order, machines);
 
-    return std::make_pair(order, futures);
+    //todo może nie std::move
+    return std::make_pair(std::move(order), futures);
 }
 
-template<typename T>
-T BlockingQueue<T>::pop() {
+
+void MachineQueue::pushPromise(product_promise_t &value) {
+    {
+        std::unique_lock<std::mutex> lock(d_mutex);
+        d_queue.push_front(std::move(value));
+    }
+    d_condition.notify_one();
+}
+
+
+product_promise_t MachineQueue::popPromise() {
     std::unique_lock<std::mutex> lock(d_mutex);
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
-    T id(std::move(d_queue.back()));
+    product_promise_t promise(std::move(d_queue.back()));
     d_queue.pop_back();
 
-    return id;
+    return promise;
 }
 
 
 void System::closeMachines() {
     for (auto &machine: machines) {
-        machine.second->stop();
+        machine.second->stopMachine();
     }
 }
 
@@ -125,10 +136,10 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
     Order newOrder(newId, products, clientTimeout);
     orders.emplace(newId, newOrder);
 
-    CoasterPager newPager(newId, newOrder);
+    CoasterPager newPager(newOrder);
     pagers.emplace(newId, newPager);
 
-    orderQueue.push(newOrder);
+    orderQueue.pushOrder(newOrder);
 
     return std::make_unique<CoasterPager>(newPager);
 }
@@ -147,14 +158,16 @@ System::collectOrder(std::unique_ptr<CoasterPager> CoasterPager) {
         case Order::EXPIRED: {
             throw OrderExpiredException();
         }
-        case Order::RECEIVED: {
-            throw BadPagerException();
-        }
         case Order::READY: {
             // Przypadki brzegowe itp.
             // zwrócenie produktu
             return {};
         }
+        case Order::RECEIVED: {
+            throw BadPagerException();
+        }
+        case Order::OTHER:
+            throw BadPagerException();
     }
 }
 
@@ -180,9 +193,23 @@ void CoasterPager::wait(unsigned int timeout) const {
 
 void System::orderWorker() {
     while (!systemOpen) {
+
         auto orderAndFutures = orderQueue.manageOrder(orderSynchronizer, machines);
+
         Order order = orderAndFutures.first;
-        auto futures = orderAndFutures.second;
+        auto futureProducts = std::move(orderAndFutures.second);
+
+        std::vector<std::unique_ptr<Product>> readyProducts;
+
+        for(auto &futureProduct: futureProducts) {
+            try {
+                auto product = futureProduct.get();
+                readyProducts.push_back(std::move(product));
+
+            } catch (BadProductException &e) {
+
+            }
+        }
     }
 }
 
