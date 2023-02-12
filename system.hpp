@@ -2,6 +2,7 @@
 #define SYSTEM_HPP
 
 #include <exception>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <functional>
@@ -132,114 +133,48 @@ private:
     std::condition_variable d_condition;
     std::deque<T> d_queue;
 public:
-    void push(T const &value) {
-        {
-            std::unique_lock<std::mutex> lock(d_mutex);
-            d_queue.push_front(value);
+    void push(T const &value);
+
+    T popOrder(MachinesSynchronizer &sync);
+
+    T pop();
+};
+
+class MachineWrapper {
+    std::string machineName;
+    std::shared_ptr<Machine> machine;
+    BlockingQueue<std::promise<unique_ptr < Product>>>
+    orderQueue;
+    std::thread thread;
+    atomic_bool &systemOpen;
+public:
+    MachineWrapper(std::string machineName,
+                   std::shared_ptr<Machine> &machine,
+                   atomic_bool &systemOpen) :
+            machineName(std::move(machineName)),
+            machine(std::move(machine)),
+            systemOpen(systemOpen) {
+        thread = std::thread([this] { machineWorker(); });
+    }
+private:
+    void machineWorker() {
+        while (!systemOpen) {
+            std::promise<unique_ptr < Product>>
+            promise = orderQueue.pop();
+            try {
+                auto product = machine->getProduct();
+                promise.set_value(std::move(product));
+
+            } catch (MachineFailure &e) {
+                promise.set_exception(std::current_exception());
+            }
         }
-        d_condition.notify_one();
-    }
-
-    T popOrder(MachinesSynchronizer &sync) {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_condition.wait(lock, [=] { return !d_queue.empty(); });
-        T order(std::move(d_queue.back()));
-        d_queue.pop_back();
-
-        sync.insertOrder(order);
-
-        return order;
-    }
-
-    T popId() {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_condition.wait(lock, [=] { return !d_queue.empty(); });
-        T id(std::move(d_queue.back()));
-        d_queue.pop_back();
-
-        return id;
     }
 };
 
 class MachinesSynchronizer {
-private:
-    std::unordered_map<std::string, std::deque<size_t>> ques; //tu zamienić
-    // na blocking queue
-    std::condition_variable condition;
-    std::mutex mutex;
-public:
-    void initialize(const std::unordered_map<std::string,
-            std::shared_ptr<Machine>> &machines) {
-        std::unique_lock<std::mutex> lock(mutex);
-        for (auto &machine: machines) {
-            ques.emplace(machine.first, std::deque<size_t>());
-        }
-    }
 
-    void insertOrder(Order &order) {
-        std::unique_lock<std::mutex> lock(mutex);
-        for (const auto &product: order.getProducts()) {
-            if (ques.count(product))
-                ques.at(product).push_front(order.getId());
-            else {
-                cout << "insertOrder: product "
-                     << product << " not found in any machine\n";
-                exit(1);
-            }
-        }
-    }
-
-    std::unique_ptr<Product> waitAndGetProduct(size_t orderId,
-                           const std::string &productStr,
-                           const std::shared_ptr<Machine> &machine) {
-        std::unique_lock<std::mutex> lock(mutex);
-        condition.wait(lock,
-                       [=] { return ques.at(productStr).back() == orderId; });
-        try {
-            lock.unlock();
-            unique_ptr <Product> product = machine->getProduct();
-            lock.lock();
-
-            ques.at(productStr).pop_back();
-            condition.notify_one();
-
-            return product;
-
-        } catch (const MachineFailure &e) {
-            throw e;
-        }
-    }
-
-    void removeOrder(size_t orderId) {
-        for (auto &que: ques) {
-            while (!que.second.empty()) {
-                for(auto it = que.second.begin(); it != que.second.end(); ++it)
-                    if (*it == orderId)
-                        que.second.erase(it);
-            }
-        }
-    }
-
-    void returnProducts(size_t orderId,
-                        const std::unordered_map<std::string,
-                        std::shared_ptr<Machine>> &machines,
-                        std::vector<std::pair<std::string,
-                        std::unique_ptr<Product>>>  &doneProducts) {
-
-        std::unique_lock<std::mutex> lock(mutex);
-        for (auto &pair: doneProducts) {
-            std::string productStr = pair.first;
-            auto product = std::move(pair.second);
-            //todo może trzeba maszynę opakować mutexem
-            machines.at(productStr)->returnProduct(std::move(product));
-        }
-
-        removeOrder(orderId);
-    }
 };
-
-
-
 
 class CoasterPager {
 private:
@@ -273,40 +208,32 @@ private:
 public:
     typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
 private:
-    unsigned int numberOfWorkers;
-    unsigned int clientTimeout;
-
+    typedef std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> machineWrappers_t;
     IdGenerator idGenerator;
+    unsigned int clientTimeout;
+    std::atomic_bool systemOpen;
+
     std::map<size_t, Order> orders;
     BlockingQueue<Order> orderQueue;
     std::map<size_t, CoasterPager> pagers;
 
-    std::atomic_bool closed;
-
     std::set<std::string> menu;
     std::mutex menuMutex;
 
-    machines_t machines;
-    std::unordered_map<std::string, MachineStatus> machineStatus;
-    MachinesSynchronizer mSynchronizer;
+    machineWrappers_t machines;
+//    MachinesSynchronizer mSynchronizer;
 
-    std::vector<std::thread> workers;
-    std::vector<struct WorkerReport> reports;
-
-    std::mutex shutdown_mutex;
+    std::vector<std::thread> orderWorkers;
+    std::vector<struct WorkerReport> workerReports;
 
 public:
     System(machines_t machines, unsigned int numberOfWorkers,
            unsigned int clientTimeout);
 
-    void informClosed();
-
     std::vector<WorkerReport> shutdown();
 
-    std::vector<std::string> getMenu() const {
-        return closed ? vector<string>() : vector<string>(menu.begin(),
-                                                          menu.end());
-    }
+    std::vector<std::string> getMenu() const;
 
     std::vector<unsigned int> getPendingOrders() const;
 
@@ -320,9 +247,9 @@ public:
     bool productsInMenu(std::vector<string> &products);
 
 private:
-    void initializeMachines(machines_t &machines);
-
     void closeMachines();
+
+    void informClosed();
 
     void orderWorker();
 

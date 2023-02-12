@@ -1,11 +1,35 @@
 #include <algorithm>
 #include "system.hpp"
 
-void System::initializeMachines(machines_t &m) {
-    for (auto &machine: m) {
-        machineStatus.emplace(machine.first, MachineStatus::OFF);
+template<typename T>
+void BlockingQueue<T>::push(T const &value) {
+    {
+        std::unique_lock<std::mutex> lock(d_mutex);
+        d_queue.push_front(value);
     }
-    mSynchronizer.initialize(m);
+    d_condition.notify_one();
+}
+
+template<typename T>
+T BlockingQueue<T>::popOrder(MachinesSynchronizer &sync) {
+    std::unique_lock<std::mutex> lock(d_mutex);
+    d_condition.wait(lock, [=] { return !d_queue.empty(); });
+    T order(std::move(d_queue.back()));
+    d_queue.pop_back();
+
+    sync.insertOrder(order);
+
+    return order;
+}
+
+template<typename T>
+T BlockingQueue<T>::pop() {
+    std::unique_lock<std::mutex> lock(d_mutex);
+    d_condition.wait(lock, [=] { return !d_queue.empty(); });
+    T id(std::move(d_queue.back()));
+    d_queue.pop_back();
+
+    return id;
 }
 
 
@@ -19,27 +43,32 @@ void System::closeMachines() {
 System::System(machines_t machines,
                unsigned int numberOfWorkers,
                unsigned int clientTimeout) :
-        numberOfWorkers(numberOfWorkers),
         clientTimeout(clientTimeout),
-        closed(false),
-        machines(std::move(machines)) {
+        systemOpen(true) {
 
-    initializeMachines(machines);
+    //map all elements of machines to wrappers and initialize them
+    for (auto &machine: machines) {
+        this->machines.emplace(machine.first,
+                               std::make_shared<MachineWrapper>(
+                                       machine.first,
+                                       machine.second,
+                                       systemOpen));
+    }
 
     for (auto &machine: machines) {
         menu.emplace(machine.first);
     }
 
     for (unsigned int i = 0; i < numberOfWorkers; i++) {
-        workers.emplace_back([this]() { orderWorker(); });
+        orderWorkers.emplace_back([this]() { orderWorker(); });
     }
 }
 
 
 std::vector<WorkerReport> System::shutdown() {
-    closed = true;
+    systemOpen = true;
 
-    for (auto &w: workers) {
+    for (auto &w: orderWorkers) {
         if (w.joinable()) {
             w.join();
         }
@@ -48,11 +77,16 @@ std::vector<WorkerReport> System::shutdown() {
     closeMachines();
     std::vector<WorkerReport> dailyReport;
 
-    for (auto &r: reports) {
+    for (auto &r: workerReports) {
         dailyReport.push_back(r);
     }
 
     return dailyReport;
+}
+
+std::vector<std::string> System::getMenu() const {
+    return systemOpen ? std::vector<std::string>() :
+           std::vector<std::string>(menu.begin(), menu.end());
 }
 
 
@@ -73,7 +107,7 @@ std::vector<unsigned int> System::getPendingOrders() const {
 
 
 std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
-    if (closed) {
+    if (systemOpen) {
         throw RestaurantClosedException();
     }
 
@@ -139,31 +173,7 @@ void CoasterPager::wait(unsigned int timeout) const {
 }
 
 void System::orderWorker() {
-    while (!closed) {
-        Order order = orderQueue.popOrder(mSynchronizer);
-        std::vector<std::pair<std::string, std::unique_ptr<Product>>>
-                doneProducts;
-
-//        for (auto &product: order.getProducts()) {
-//            auto machine = machines.find(product);
-//            if (machine != machines.end()) {
-//                try {
-//                    std::unique_ptr<Product> newProduct = mSynchronizer
-//                            .waitAndGetProduct(order.getId(),
-//                                                    machine->first,
-//                                                    machine->second);
-//                    doneProducts.emplace_back(machine->first, std::move(newProduct));
-//                } catch (MachineFailure &e) {
-//                    // zwrócenie produktów
-//
-//                }
-//
-//            } else {
-//                mSynchronizer.returnProducts(order.getId(), machines,
-//                                             doneProducts);
-//                order.setStatus(Order::NOT_FOUND);
-//            }
-//        }
+    while (!systemOpen) {
 
     }
 }
