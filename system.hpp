@@ -53,22 +53,44 @@ private:
 
     OrderStatus status;
     std::chrono::time_point<std::chrono::system_clock> doneTime;
-    std::unique_ptr<std::mutex> orderInfoMutex;
+    std::shared_ptr<std::mutex> orderInfoMutex;
+    std::shared_ptr<std::condition_variable> clientNotifier;
 public:
     Order(size_t id,
-          std::vector <std::string> &products,
+          std::vector<std::string> &products,
           unsigned int timeout) :
             id(id),
             timeout(timeout),
             products(products),
             status(NOT_DONE),
-            orderInfoMutex(std::make_unique<std::mutex>()) {}
+            orderInfoMutex(std::make_shared<std::mutex>()) {}
+
+    void wait() {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
+        clientNotifier->wait(lock, [=] { return status != NOT_DONE; });
+        if (status != READY) {
+            throw FulfillmentFailure();
+        }
+    }
+
+    void wait_for(unsigned int time) {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
+        clientNotifier->wait_for(lock, std::chrono::milliseconds(time), [=] {
+            return status != NOT_DONE;
+        });
+        if (status != READY) {
+            throw FulfillmentFailure();
+        }
+    }
 
     void markDone(std::vector<std::unique_ptr<Product>> &achievedProducts) {
-        std::unique_lock<std::mutex> lock(*orderInfoMutex);
-        readyProducts = std::move(achievedProducts);
-        doneTime = std::chrono::system_clock::now();
-        status = READY;
+        {
+            std::unique_lock<std::mutex> lock(*orderInfoMutex);
+            readyProducts = std::move(achievedProducts);
+            doneTime = std::chrono::system_clock::now();
+            status = READY;
+        }
+        clientNotifier->notify_one();
     }
 
     [[nodiscard]] size_t getId() const {
@@ -76,7 +98,7 @@ public:
         return id;
     }
 
-    [[nodiscard]] std::vector <std::string> getProductNames() {
+    [[nodiscard]] std::vector<std::string> getProductNames() {
         std::unique_lock<std::mutex> lock(*orderInfoMutex);
         return products;
     }
@@ -116,6 +138,9 @@ public:
         std::unique_lock<std::mutex> lock(*orderInfoMutex);
         status = newStatus;
     }
+
+    std::shared_ptr<std::mutex> getMutex() { return orderInfoMutex; }
+
 };
 
 struct WorkerReport {
@@ -126,23 +151,32 @@ struct WorkerReport {
 };
 
 class WorkerReportUpdater {
+
 private:
     struct WorkerReport report;
 public:
-    void updateFailedOrder(Order &order) {
-        report.failedOrders.push_back(order.getProductNames());
+    enum ACTION {
+        FAIL,
+        COLLECT,
+        ABANDON
+    };
+
+    void updateOrder(Order &order, ACTION a) {
+        switch (a) {
+            case FAIL:
+                report.failedOrders.push_back(order.getProductNames());
+                break;
+            case COLLECT:
+                report.collectedOrders.push_back(order.getProductNames());
+                break;
+            case ABANDON:
+                report.abandonedOrders.push_back(order.getProductNames());
+                break;
+        }
     }
 
     void updateFailedProduct(std::string &product) {
         report.failedProducts.push_back(product);
-    }
-
-    void updateCollectedOrder(Order &order) {
-        report.collectedOrders.push_back(order.getProductNames());
-    }
-
-    void updateAbandonedOrder(Order &order) {
-        report.abandonedOrders.push_back(order.getProductNames());
     }
 
     WorkerReport getReport() {
@@ -151,11 +185,11 @@ public:
 };
 
 class OrderSynchronizer;
+
 class MachineWrapper;
 
 class OrderQueue {
 private:
-    typedef std::future<std::unique_ptr<Product>> product_future_t;
     std::mutex d_mutex;
     std::condition_variable d_condition;
     std::deque<std::shared_ptr<Order>> d_queue;
@@ -212,7 +246,6 @@ public:
         machineQueue.pushPromise(promise);
     }
 
-    //todo może usunąć referncję
     void returnProduct(std::unique_ptr<Product> &product) {
         std::unique_lock<std::mutex> lock(returnProductMutex);
         machine->returnProduct(std::move(product));
@@ -225,7 +258,6 @@ public:
     }
 
 private:
-
     void startMachine() {
         machine->start();
         status = ON;
@@ -265,7 +297,7 @@ private:
             }
         }
 
-        if(status == ON) {
+        if (status == ON) {
             stopMachine();
         }
     }
@@ -280,6 +312,7 @@ private:
     std::mutex mutex;
 
 public:
+    /* Zakładamy, że wszystkie nazwy produktów w zamówieniu są poprawne. */
     std::vector<std::pair<std::string, product_future_t>>
     insertOrderToMachines(Order &order,
                           std::unordered_map<std::string,
@@ -310,12 +343,11 @@ private:
             order(order) {}
 
     std::shared_ptr<Order> getOrder() { return order; }
-
 public:
 
-    void wait() const;
+    void wait() const { order->wait(); }
 
-    void wait(unsigned int timeout) const;
+    void wait(unsigned int timeout) const { order->wait_for(timeout); }
 
     [[nodiscard]] unsigned int getId() const { return order->getId(); };
 
@@ -334,20 +366,20 @@ public:
     typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
 private:
     typedef std::unordered_map<std::string,
-            std::shared_ptr<MachineWrapper>> machineWrappers_t;
+            std::shared_ptr<MachineWrapper>> machine_wrappers_t;
+
     IdGenerator idGenerator;
     unsigned int clientTimeout;
     std::atomic_bool systemOpen;
 
-    OrderSynchronizer orderSynchronizer;
-    std::map<size_t, std::shared_ptr<Order>> orders;
-    OrderQueue orderQueue;
-    std::map<size_t, CoasterPager> pagers;
+    machine_wrappers_t machines;
 
     std::set<std::string> menu;
     std::mutex menuMutex;
 
-    machineWrappers_t machines;
+    OrderSynchronizer orderSynchronizer;
+    std::map<size_t, std::shared_ptr<Order>> orders;
+    OrderQueue orderQueue;
 
     std::vector<std::thread> orderWorkers;
     std::vector<WorkerReport> workerReports;
@@ -369,8 +401,10 @@ public:
     collectOrder(std::unique_ptr<CoasterPager> CoasterPager);
 
     unsigned int getClientTimeout() const { return clientTimeout; }
+
 private:
     bool productsInMenu(std::vector<std::string> &products);
+
     void removeFromMenu(std::string &product);
 
     void returnProducts(

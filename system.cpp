@@ -7,17 +7,17 @@ typedef std::future<std::unique_ptr<Product>> product_future_t;
 void OrderQueue::pushOrder(std::shared_ptr<Order> &order) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_front(std::move(order));
+        d_queue.push_back(order);
     }
     d_condition.notify_one();
 }
 
 std::shared_ptr<Order>
 OrderQueue::popOrder(std::unique_lock<std::mutex> &lock) {
-
+    /* Zakładamy, że lock zostanie ustawiony przed wywołaniem funkcji. */
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
     std::shared_ptr<Order> order(std::move(d_queue.back()));
-    d_queue.pop_back();
+    d_queue.pop_front();
 
     return order;
 }
@@ -31,7 +31,7 @@ bool OrderQueue::isEmpty() {
 void MachineQueue::pushPromise(product_promise_t &value) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_front(std::move(value));
+        d_queue.push_back(std::move(value));
     }
     d_condition.notify_one();
 }
@@ -47,7 +47,7 @@ product_promise_t MachineQueue::popPromise(std::atomic_bool
         return {};
     }
     product_promise_t promise(std::move(d_queue.back()));
-    d_queue.pop_back();
+    d_queue.pop_front();
 
     return promise;
 }
@@ -108,15 +108,12 @@ std::vector<WorkerReport> System::shutdown() {
 }
 
 std::vector<std::string> System::getMenu() const {
-    return systemOpen ? std::vector<std::string>() :
+    return !systemOpen ? std::vector<std::string>() :
            std::vector<std::string>(menu.begin(), menu.end());
 }
 
 
 std::vector<unsigned int> System::getPendingOrders() const {
-
-    std::chrono::system_clock::time_point now
-            = std::chrono::system_clock::now();
     std::vector<unsigned int> pendingOrders;
 
     for (auto &element: orders) {
@@ -125,6 +122,7 @@ std::vector<unsigned int> System::getPendingOrders() const {
             pendingOrders.push_back(order->getId());
         }
     }
+
     return pendingOrders;
 }
 
@@ -142,14 +140,10 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
     auto newOrder = std::make_shared<Order>(
             Order(newId, products, clientTimeout));
 
-
-    CoasterPager newPager(newOrder);
-    pagers.emplace(newId, newPager);
-
     orders.emplace(newId, newOrder);
     orderQueue.pushOrder(newOrder);
 
-    return std::make_unique<CoasterPager>(newPager);
+    return std::make_unique<CoasterPager>(CoasterPager(newOrder));
 }
 
 
@@ -157,25 +151,21 @@ std::vector<std::unique_ptr<Product>>
 System::collectOrder(std::unique_ptr<CoasterPager> CoasterPager) {
     auto orderStatus = CoasterPager->getOrder()->getStatus();
     switch (orderStatus) {
-        case Order::BROKEN_MACHINE: {
+        case Order::BROKEN_MACHINE:
             throw FulfillmentFailure();
-        }
-        case Order::NOT_DONE: {
+        case Order::NOT_DONE:
             throw OrderNotReadyException();
-        }
-        case Order::EXPIRED: {
+        case Order::EXPIRED:
             throw OrderExpiredException();
-        }
+        case Order::RECEIVED:
+        case Order::OTHER:
+            throw BadPagerException();
         case Order::READY: {
             // Przypadki brzegowe itp.
             // zwrócenie produktu
             return {};
         }
-        case Order::RECEIVED: {
-            throw BadPagerException();
-        }
-        case Order::OTHER:
-            throw BadPagerException();
+
     }
 }
 
@@ -187,16 +177,6 @@ bool System::productsInMenu(std::vector<std::string> &products) {
                                [this](std::string &product) {
                                    return menu.contains(product);
                                });
-}
-
-
-void CoasterPager::wait() const {
-
-}
-
-
-void CoasterPager::wait(unsigned int timeout) const {
-
 }
 
 void System::returnProducts(
@@ -248,23 +228,22 @@ void System::orderWorker() {
         }
 
         if (orderPtr->getStatus() == Order::BROKEN_MACHINE) {
-            infoUpdater.updateFailedOrder(*orderPtr);
+            infoUpdater.updateOrder(*orderPtr, WorkerReportUpdater::FAIL);
             /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
             returnProducts(readyProducts);
         } else {
-            orderPtr->setStatus(Order::READY);
-            //budzenie osoby czekającej na CoasterPager
+            orderPtr->markDone(readyProducts);
+            //budzenie osoby czekającej na coasterpager
 
-            //czekanie na klienta przez timeout milisekund
+            //czekanie na klienta przez timeout milisekund,
             //jeśli się pojawi, uznanie zamówienia za skończone
             //send order
             orderPtr->setStatus(Order::RECEIVED);
-            infoUpdater.updateCollectedOrder(*orderPtr);
+            infoUpdater.updateOrder(*orderPtr, WorkerReportUpdater::COLLECT);
 
             //jeśli nie, uznanie zamówienia za abandoned
             orderPtr->setStatus(Order::EXPIRED);
-            infoUpdater.updateAbandonedOrder(*orderPtr);
-
+            infoUpdater.updateOrder(*orderPtr, WorkerReportUpdater::ABANDON);
         }
 
         // ...
