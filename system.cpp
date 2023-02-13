@@ -21,6 +21,11 @@ Order OrderQueue::popOrder(std::unique_lock<std::mutex> &lock) {
     return order;
 }
 
+bool OrderQueue::isEmpty() {
+    std::unique_lock<std::mutex> lock(d_mutex);
+    return d_queue.empty();
+}
+
 
 void MachineQueue::pushPromise(product_promise_t &value) {
     {
@@ -31,9 +36,15 @@ void MachineQueue::pushPromise(product_promise_t &value) {
 }
 
 
-product_promise_t MachineQueue::popPromise() {
+product_promise_t MachineQueue::popPromise(std::atomic_bool
+                                           &orderWorkersEnded) {
     std::unique_lock<std::mutex> lock(d_mutex);
-    d_condition.wait(lock, [=] { return !d_queue.empty(); });
+    d_condition.wait(lock, [this, &orderWorkersEnded] {
+        return !d_queue.empty() || orderWorkersEnded;
+    });
+    if (orderWorkersEnded) {
+        return {};
+    }
     product_promise_t promise(std::move(d_queue.back()));
     d_queue.pop_back();
 
@@ -53,7 +64,8 @@ System::System(machines_t machines,
                unsigned int numberOfWorkers,
                unsigned int clientTimeout) :
         clientTimeout(clientTimeout),
-        systemOpen(true) {
+        systemOpen(true),
+        orderWorkersEnded(false) {
 
     //map all elements of machines to wrappers and initialize them
     for (auto &machine: machines) {
@@ -61,7 +73,7 @@ System::System(machines_t machines,
                                std::make_shared<MachineWrapper>(
                                        machine.first,
                                        machine.second,
-                                       systemOpen));
+                                       orderWorkersEnded));
 
     }
 
@@ -83,6 +95,8 @@ std::vector<WorkerReport> System::shutdown() {
             w.join();
         }
     }
+
+    orderWorkersEnded = true;
 
     return workerReports;
 }
@@ -189,7 +203,9 @@ void System::returnProducts(
 void System::orderWorker() {
     WorkerReportUpdater infoUpdater;
 
-    while (!systemOpen) {
+    /* Pracownik wykonuje pracę, dopóki system nie zamknie się i kolejka nie
+     * będzie pusta. */
+    while (systemOpen || !orderQueue.isEmpty()) {
 
         /* Zablokowanie kolejki zamówień. */
         std::unique_lock<std::mutex> lock(orderQueue.getMutex());

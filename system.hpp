@@ -163,6 +163,8 @@ public:
 
     Order popOrder(std::unique_lock<std::mutex> &lock);
 
+    bool isEmpty();
+
     std::mutex &getMutex() { return d_mutex; }
 };
 
@@ -176,7 +178,7 @@ private:
 public:
     void pushPromise(product_promise_t &value);
 
-    product_promise_t popPromise();
+    product_promise_t popPromise(std::atomic_bool &ended);
 };
 
 class MachineWrapper {
@@ -191,18 +193,18 @@ private:
     std::shared_ptr<Machine> machine;
     MachineStatus status;
     MachineQueue machineQueue;
-    std::thread thread;
-    std::atomic_bool &systemOpen;
+    std::thread worker;
+    std::atomic_bool &orderWorkersEnded;
     std::mutex returnProductMutex;
 public:
     MachineWrapper(std::string machineName,
                    std::shared_ptr<Machine> &machine,
-                   std::atomic_bool &systemOpen) :
+                   std::atomic_bool &orderWorkersEnded) :
             machineName(std::move(machineName)),
             machine(std::move(machine)),
             status(OFF),
-            systemOpen(systemOpen) {
-        thread = std::thread([this] { machineWorker(); });
+            orderWorkersEnded(orderWorkersEnded) {
+        worker = std::thread([this] { machineWorker(); });
     }
 
     void insertToQueue(std::promise<std::unique_ptr<Product>> &promise) {
@@ -213,6 +215,12 @@ public:
     void returnProduct(std::unique_ptr<Product> &product) {
         std::unique_lock<std::mutex> lock(returnProductMutex);
         machine->returnProduct(std::move(product));
+    }
+
+    ~MachineWrapper() {
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
 
 private:
@@ -228,10 +236,20 @@ private:
     }
 
     void machineWorker() {
-        // todo: sytuacja, w której wątek czeka na kolejce, a system zamyka się
-        while (!systemOpen) {
+        /* Obsługa maszyny trwa do momentu, aż wszystkie wątki kompletujące
+         * zamówienia zakończą pracę. */
+        while (!orderWorkersEnded) {
+            /* Czekamy na kolejce, wyciągamy polecenie wyprodukowania
+             * produktu. */
             std::promise<std::unique_ptr<Product>>
-                    promise = machineQueue.popPromise();
+                    promise = machineQueue.popPromise(orderWorkersEnded);
+
+            /* Sytuacja, w której wyszliśmy z czekania z kolejki, bo wszyscy
+             * pracownicy od zamówień skończyli pracę i nie ma już żadnej
+             * pracy do wykonania.  */
+            if (orderWorkersEnded) {
+                break;
+            }
 
             if (status == OFF) {
                 startMachine();
@@ -248,12 +266,6 @@ private:
 
         if(status == ON) {
             stopMachine();
-        }
-    }
-
-    ~MachineWrapper() {
-        if (thread.joinable()) {
-            thread.join();
         }
     }
 };
@@ -338,6 +350,7 @@ private:
 
     std::vector<std::thread> orderWorkers;
     std::vector<WorkerReport> workerReports;
+    std::atomic_bool orderWorkersEnded;
 
 public:
     System(machines_t machines, unsigned int numberOfWorkers,
