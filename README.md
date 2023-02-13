@@ -185,7 +185,7 @@ danym numerem.
 ## Format oddawania
 
 Program powinien być napisany w języku `C++` i kompilować się na students z
-flagami `-std=c++20 -Wall -Wextra -Werror -pedantic -fsanitize=undefined,worker`. Rozwiązania
+flagami `-std=c++20 -Wall -Wextra -Werror -pedantic -fsanitize=undefined,thread`. Rozwiązania
 niespełniające tego warunku nie będą sprawdzane.
 Rozwiązanie powinno składać się z jednego archiwum `ab123456.zip`, gdzie `ab123456` to login
 na `students`
