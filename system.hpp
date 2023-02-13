@@ -15,12 +15,6 @@
 
 #include "machine.hpp"
 
-enum MachineStatus {
-    OFF,
-    ON,
-    BROKEN
-};
-
 class FulfillmentFailure : public std::exception {
 };
 
@@ -39,12 +33,6 @@ class OrderExpiredException : public std::exception {
 class RestaurantClosedException : public std::exception {
 };
 
-struct WorkerReport {
-    std::vector<std::vector<std::string>> collectedOrders;
-    std::vector<std::vector<std::string>> abandonedOrders;
-    std::vector<std::vector<std::string>> failedOrders;
-    std::vector<std::string> failedProducts;
-};
 
 class Order {
 public:
@@ -65,35 +53,36 @@ private:
 
     OrderStatus status;
     std::chrono::time_point<std::chrono::system_clock> doneTime;
-//    std::mutex orderInfoMutex;
+    std::unique_ptr<std::mutex> orderInfoMutex;
 public:
     Order(size_t id,
-          vector <std::string> &products,
+          std::vector <std::string> &products,
           unsigned int timeout) :
             id(id),
             timeout(timeout),
             products(products),
-            status(NOT_DONE) {}
+            status(NOT_DONE),
+            orderInfoMutex(std::make_unique<std::mutex>()) {}
 
     void markDone(std::vector<std::unique_ptr<Product>> &achievedProducts) {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         readyProducts = std::move(achievedProducts);
         doneTime = std::chrono::system_clock::now();
         status = READY;
     }
 
-    [[nodiscard]] size_t getId() {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
+    [[nodiscard]] size_t getId() const {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         return id;
     }
 
-    [[nodiscard]] vector <std::string> getProducts() {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
+    [[nodiscard]] std::vector <std::string> getProductNames() {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         return products;
     }
 
     [[nodiscard]] bool isReady() {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         checkIfExpired();
         return status == READY;
     }
@@ -108,10 +97,8 @@ public:
         }
     }
 
-    bool checkIfPending() {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
-        checkIfExpired();
-
+    [[nodiscard]] bool checkIfPending() const {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         if (status == READY || status == NOT_DONE) {
             return true;
         }
@@ -119,9 +106,46 @@ public:
     }
 
     OrderStatus getStatus() {
-//        std::unique_lock<std::mutex> lock(orderInfoMutex);
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
         checkIfExpired();
         return status;
+    }
+
+    void setStatus(OrderStatus newStatus) {
+        std::unique_lock<std::mutex> lock(*orderInfoMutex);
+        status = newStatus;
+    }
+};
+
+struct WorkerReport {
+    std::vector<std::vector<std::string>> collectedOrders;
+    std::vector<std::vector<std::string>> abandonedOrders;
+    std::vector<std::vector<std::string>> failedOrders;
+    std::vector<std::string> failedProducts;
+};
+
+class WorkerReportUpdater {
+private:
+    struct WorkerReport report;
+public:
+    void updateFailedOrder(Order &order) {
+        report.failedOrders.push_back(order.getProductNames());
+    }
+
+    void updateFailedProduct(std::string &product) {
+        report.failedProducts.push_back(product);
+    }
+
+    void updateCollectedOrder(Order &order) {
+        report.collectedOrders.push_back(order.getProductNames());
+    }
+
+    void updateAbandonedOrder(Order &order) {
+        report.abandonedOrders.push_back(order.getProductNames());
+    }
+
+    WorkerReport getReport() {
+        return report;
     }
 };
 
@@ -137,9 +161,9 @@ private:
 public:
     void pushOrder(Order &value);
 
-    std::pair<Order, std::vector<product_future_t>>
-    manageOrder(OrderSynchronizer &sync, std::unordered_map<std::string,
-            std::shared_ptr<MachineWrapper>> &machines);
+    Order popOrder(std::unique_lock<std::mutex> &lock);
+
+    std::mutex &getMutex() { return d_mutex; }
 };
 
 
@@ -156,18 +180,27 @@ public:
 };
 
 class MachineWrapper {
+public:
+    enum MachineStatus {
+        OFF,
+        ON,
+        BROKEN
+    };
+private:
     std::string machineName;
     std::shared_ptr<Machine> machine;
+    MachineStatus status;
     MachineQueue machineQueue;
     std::thread thread;
-    atomic_bool &systemOpen;
+    std::atomic_bool &systemOpen;
     std::mutex returnProductMutex;
 public:
     MachineWrapper(std::string machineName,
                    std::shared_ptr<Machine> &machine,
-                   atomic_bool &systemOpen) :
+                   std::atomic_bool &systemOpen) :
             machineName(std::move(machineName)),
             machine(std::move(machine)),
+            status(OFF),
             systemOpen(systemOpen) {
         thread = std::thread([this] { machineWorker(); });
     }
@@ -182,14 +215,28 @@ public:
         machine->returnProduct(std::move(product));
     }
 
-    void stopMachine() { machine->stop(); }
-
 private:
+
+    void startMachine() {
+        machine->start();
+        status = ON;
+    }
+
+    void stopMachine() {
+        machine->stop();
+        status = OFF;
+    }
+
     void machineWorker() {
         // todo: sytuacja, w której wątek czeka na kolejce, a system zamyka się
         while (!systemOpen) {
             std::promise<std::unique_ptr<Product>>
                     promise = machineQueue.popPromise();
+
+            if (status == OFF) {
+                startMachine();
+            }
+
             try {
                 auto product = machine->getProduct();
                 promise.set_value(std::move(product));
@@ -197,6 +244,16 @@ private:
             } catch (MachineFailure &e) {
                 promise.set_exception(std::current_exception());
             }
+        }
+
+        if(status == ON) {
+            stopMachine();
+        }
+    }
+
+    ~MachineWrapper() {
+        if (thread.joinable()) {
+            thread.join();
         }
     }
 };
@@ -210,23 +267,23 @@ private:
     std::mutex mutex;
 
 public:
-    std::vector<product_future_t>
+    std::vector<std::pair<std::string, product_future_t>>
     insertOrderToMachines(Order &order,
                           std::unordered_map<std::string,
                                   std::shared_ptr<MachineWrapper>> &machines) {
 
         std::unique_lock<std::mutex> lock(mutex);
 
-        std::vector<product_future_t> futures;
-        for (const auto &productName: order.getProducts()) {
+        std::vector<std::pair<std::string, product_future_t>> futureProducts;
+        for (const auto &productName: order.getProductNames()) {
 
             product_promise_t newPromise;
             product_future_t newFuture = newPromise.get_future();
 
             machines.at(productName)->insertToQueue(newPromise);
-            futures.push_back(std::move(newFuture));
+            futureProducts.emplace_back(productName, std::move(newFuture));
         }
-        return futures;
+        return futureProducts;
     }
 };
 
@@ -271,7 +328,7 @@ private:
 
     OrderSynchronizer orderSynchronizer;
     std::map<size_t, Order> orders;
-    MachineQueue<Order> orderQueue;
+    OrderQueue orderQueue;
     std::map<size_t, CoasterPager> pagers;
 
     std::set<std::string> menu;
@@ -280,7 +337,7 @@ private:
     machineWrappers_t machines;
 
     std::vector<std::thread> orderWorkers;
-    std::vector<struct WorkerReport> workerReports;
+    std::vector<WorkerReport> workerReports;
 
 public:
     System(machines_t machines, unsigned int numberOfWorkers,
@@ -298,17 +355,15 @@ public:
     collectOrder(std::unique_ptr<CoasterPager> CoasterPager);
 
     unsigned int getClientTimeout() const { return clientTimeout; }
-
-    bool productsInMenu(std::vector<string> &products);
-
 private:
-    void closeMachines();
+    bool productsInMenu(std::vector<std::string> &products);
+    void removeFromMenu(std::string &product);
 
-    void informClosed();
+    void returnProducts(
+            std::vector<std::pair<std::string, std::unique_ptr<Product>>>
+            &readyProducts);
 
     void orderWorker();
-
-    void machineWorker();
 };
 
 

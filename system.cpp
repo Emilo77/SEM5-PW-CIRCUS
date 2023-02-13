@@ -4,29 +4,21 @@
 typedef std::promise<std::unique_ptr<Product>> product_promise_t;
 typedef std::future<std::unique_ptr<Product>> product_future_t;
 
-void OrderQueue::pushOrder(Order &value) {
+void OrderQueue::pushOrder(Order &order) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_front(std::move(value));
+        d_queue.push_front(std::move(order));
     }
     d_condition.notify_one();
 }
 
-std::pair<Order, std::vector<product_future_t>>
-OrderQueue::manageOrder(OrderSynchronizer &sync,
-                             std::unordered_map<std::string,
-                                     std::shared_ptr<MachineWrapper>> &machines) {
-
-    std::unique_lock<std::mutex> lock(d_mutex);
+Order OrderQueue::popOrder(std::unique_lock<std::mutex> &lock) {
 
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
-    Order order(d_queue.back());
+    Order order(std::move(d_queue.back()));
     d_queue.pop_back();
 
-    auto futures = sync.insertOrderToMachines(order, machines);
-
-    //todo może nie std::move
-    return std::make_pair(std::move(order), futures);
+    return order;
 }
 
 
@@ -48,10 +40,11 @@ product_promise_t MachineQueue::popPromise() {
     return promise;
 }
 
-
-void System::closeMachines() {
-    for (auto &machine: machines) {
-        machine.second->stopMachine();
+void System::removeFromMenu(std::string &product) {
+    std::unique_lock<std::mutex> lock(menuMutex);
+    auto it = std::find(menu.begin(), menu.end(), product);
+    if (it != menu.end()) {
+        menu.erase(it);
     }
 }
 
@@ -83,7 +76,7 @@ System::System(machines_t machines,
 
 
 std::vector<WorkerReport> System::shutdown() {
-    systemOpen = true;
+    systemOpen = false;
 
     for (auto &w: orderWorkers) {
         if (w.joinable()) {
@@ -91,14 +84,7 @@ std::vector<WorkerReport> System::shutdown() {
         }
     }
 
-    closeMachines();
-    std::vector<WorkerReport> dailyReport;
-
-    for (auto &r: workerReports) {
-        dailyReport.push_back(r);
-    }
-
-    return dailyReport;
+    return workerReports;
 }
 
 std::vector<std::string> System::getMenu() const {
@@ -113,8 +99,8 @@ std::vector<unsigned int> System::getPendingOrders() const {
             = std::chrono::system_clock::now();
     std::vector<unsigned int> pendingOrders;
 
-    for (const auto &element: orders) {
-        auto order = element.second;
+    for (auto &element: orders) {
+        const Order &order = element.second;
         if (order.checkIfPending()) {
             pendingOrders.push_back(order.getId());
         }
@@ -124,21 +110,22 @@ std::vector<unsigned int> System::getPendingOrders() const {
 
 
 std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
-    if (systemOpen) {
+    if (!systemOpen) {
         throw RestaurantClosedException();
     }
 
-    if (!productsInMenu(products) || products.empty()) {
+    if (products.empty() || !productsInMenu(products)) {
         throw BadOrderException();
     }
 
     size_t newId = idGenerator.newId();
     Order newOrder(newId, products, clientTimeout);
-    orders.emplace(newId, newOrder);
+
 
     CoasterPager newPager(newOrder);
     pagers.emplace(newId, newPager);
 
+    orders.emplace(newId, std::move(newOrder));
     orderQueue.pushOrder(newOrder);
 
     return std::make_unique<CoasterPager>(newPager);
@@ -191,29 +178,77 @@ void CoasterPager::wait(unsigned int timeout) const {
 
 }
 
-void System::orderWorker() {
-    while (!systemOpen) {
-
-        auto orderAndFutures = orderQueue.manageOrder(orderSynchronizer, machines);
-
-        Order order = orderAndFutures.first;
-        auto futureProducts = std::move(orderAndFutures.second);
-
-        std::vector<std::unique_ptr<Product>> readyProducts;
-
-        for(auto &futureProduct: futureProducts) {
-            try {
-                auto product = futureProduct.get();
-                readyProducts.push_back(std::move(product));
-
-            } catch (BadProductException &e) {
-
-            }
-        }
+void System::returnProducts(
+        std::vector<std::pair<std::string, std::unique_ptr<Product>>>
+        &readyProducts) {
+    for (auto &product: readyProducts) {
+        machines.at(product.first)->returnProduct(product.second);
     }
 }
 
-void System::machineWorker() {
+void System::orderWorker() {
+    WorkerReportUpdater infoUpdater;
 
+    while (!systemOpen) {
+
+        /* Zablokowanie kolejki zamówień. */
+        std::unique_lock<std::mutex> lock(orderQueue.getMutex());
+
+        /* Odebranie zamówienia z kolejki blokującej. */
+        Order order = orderQueue.popOrder(lock);
+
+        /* Zlecenie maszynom wyprodukowanie produktów. */
+        auto futureProducts = orderSynchronizer.insertOrderToMachines(order,
+
+                                                                      machines);
+        /* Odblokowanie kolejki zamówień. */
+        lock.unlock();
+
+        /* Wyprodukowane produkty przez maszyny. */
+        std::vector<std::pair<std::string, std::unique_ptr<Product>>>
+                readyProducts;
+
+        for (auto &futureProduct: futureProducts) {
+            std::string productName = futureProduct.first;
+            try {
+                auto product = futureProduct.second.get();
+
+                /* Jeżeli wyprodukowanie powiodło się, dodanie do kontenera.*/
+                readyProducts.emplace_back(productName, std::move(product));
+
+            } catch (BadProductException &e) {
+                removeFromMenu(productName);
+                /* W przypadku awarii maszyny, zaznaczenie informacji. */
+                order.setStatus(Order::BROKEN_MACHINE);
+                infoUpdater.updateFailedProduct(productName);
+            }
+        }
+
+        if (order.getStatus() == Order::BROKEN_MACHINE) {
+            infoUpdater.updateFailedOrder(order);
+            /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
+            returnProducts(readyProducts);
+        } else {
+            order.setStatus(Order::READY);
+            //budzenie osoby czekającej na CoasterPager
+
+            //czekanie na klienta przez timeout milisekund
+            //jeśli się pojawi, uznanie zamówienia za skończone
+            //send order
+            order.setStatus(Order::RECEIVED);
+            infoUpdater.updateCollectedOrder(order);
+
+            //jeśli nie, uznanie zamówienia za abandoned
+            order.setStatus(Order::EXPIRED);
+            infoUpdater.updateAbandonedOrder(order);
+
+        }
+
+        // ...
+
+    }
+
+    workerReports.push_back(infoUpdater.getReport());
 }
+
 
