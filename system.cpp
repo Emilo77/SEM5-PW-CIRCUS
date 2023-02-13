@@ -4,7 +4,7 @@
 typedef std::promise<std::unique_ptr<Product>> product_promise_t;
 typedef std::future<std::unique_ptr<Product>> product_future_t;
 
-void OrderQueue::pushOrder(Order &order) {
+void OrderQueue::pushOrder(std::shared_ptr<Order> &order) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
         d_queue.push_front(std::move(order));
@@ -12,10 +12,11 @@ void OrderQueue::pushOrder(Order &order) {
     d_condition.notify_one();
 }
 
-Order OrderQueue::popOrder(std::unique_lock<std::mutex> &lock) {
+std::shared_ptr<Order>
+OrderQueue::popOrder(std::unique_lock<std::mutex> &lock) {
 
     d_condition.wait(lock, [=] { return !d_queue.empty(); });
-    Order order(std::move(d_queue.back()));
+    std::shared_ptr<Order> order(std::move(d_queue.back()));
     d_queue.pop_back();
 
     return order;
@@ -98,6 +99,11 @@ std::vector<WorkerReport> System::shutdown() {
 
     orderWorkersEnded = true;
 
+    // todo może to by się udało jakoś zrobić w destruktorze MachineWrapper
+    for (auto &element: machines) {
+        element.second->joinMachineWorker();
+    }
+
     return workerReports;
 }
 
@@ -114,9 +120,9 @@ std::vector<unsigned int> System::getPendingOrders() const {
     std::vector<unsigned int> pendingOrders;
 
     for (auto &element: orders) {
-        const Order &order = element.second;
-        if (order.checkIfPending()) {
-            pendingOrders.push_back(order.getId());
+        auto order = element.second;
+        if (order->checkIfPending()) {
+            pendingOrders.push_back(order->getId());
         }
     }
     return pendingOrders;
@@ -133,13 +139,14 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
     }
 
     size_t newId = idGenerator.newId();
-    Order newOrder(newId, products, clientTimeout);
+    auto newOrder = std::make_shared<Order>(
+            Order(newId, products, clientTimeout));
 
 
     CoasterPager newPager(newOrder);
     pagers.emplace(newId, newPager);
 
-    orders.emplace(newId, std::move(newOrder));
+    orders.emplace(newId, newOrder);
     orderQueue.pushOrder(newOrder);
 
     return std::make_unique<CoasterPager>(newPager);
@@ -148,7 +155,7 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
 
 std::vector<std::unique_ptr<Product>>
 System::collectOrder(std::unique_ptr<CoasterPager> CoasterPager) {
-    auto orderStatus = CoasterPager->getOrder().getStatus();
+    auto orderStatus = CoasterPager->getOrder()->getStatus();
     switch (orderStatus) {
         case Order::BROKEN_MACHINE: {
             throw FulfillmentFailure();
@@ -211,10 +218,10 @@ void System::orderWorker() {
         std::unique_lock<std::mutex> lock(orderQueue.getMutex());
 
         /* Odebranie zamówienia z kolejki blokującej. */
-        Order order = orderQueue.popOrder(lock);
+        auto orderPtr = orderQueue.popOrder(lock);
 
         /* Zlecenie maszynom wyprodukowanie produktów. */
-        auto futureProducts = orderSynchronizer.insertOrderToMachines(order,
+        auto futureProducts = orderSynchronizer.insertOrderToMachines(*orderPtr,
 
                                                                       machines);
         /* Odblokowanie kolejki zamówień. */
@@ -235,28 +242,28 @@ void System::orderWorker() {
             } catch (BadProductException &e) {
                 removeFromMenu(productName);
                 /* W przypadku awarii maszyny, zaznaczenie informacji. */
-                order.setStatus(Order::BROKEN_MACHINE);
+                orderPtr->setStatus(Order::BROKEN_MACHINE);
                 infoUpdater.updateFailedProduct(productName);
             }
         }
 
-        if (order.getStatus() == Order::BROKEN_MACHINE) {
-            infoUpdater.updateFailedOrder(order);
+        if (orderPtr->getStatus() == Order::BROKEN_MACHINE) {
+            infoUpdater.updateFailedOrder(*orderPtr);
             /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
             returnProducts(readyProducts);
         } else {
-            order.setStatus(Order::READY);
+            orderPtr->setStatus(Order::READY);
             //budzenie osoby czekającej na CoasterPager
 
             //czekanie na klienta przez timeout milisekund
             //jeśli się pojawi, uznanie zamówienia za skończone
             //send order
-            order.setStatus(Order::RECEIVED);
-            infoUpdater.updateCollectedOrder(order);
+            orderPtr->setStatus(Order::RECEIVED);
+            infoUpdater.updateCollectedOrder(*orderPtr);
 
             //jeśli nie, uznanie zamówienia za abandoned
-            order.setStatus(Order::EXPIRED);
-            infoUpdater.updateAbandonedOrder(order);
+            orderPtr->setStatus(Order::EXPIRED);
+            infoUpdater.updateAbandonedOrder(*orderPtr);
 
         }
 

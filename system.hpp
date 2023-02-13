@@ -97,8 +97,9 @@ public:
         }
     }
 
-    [[nodiscard]] bool checkIfPending() const {
+    [[nodiscard]] bool checkIfPending() {
         std::unique_lock<std::mutex> lock(*orderInfoMutex);
+        checkIfExpired();
         if (status == READY || status == NOT_DONE) {
             return true;
         }
@@ -157,11 +158,11 @@ private:
     typedef std::future<std::unique_ptr<Product>> product_future_t;
     std::mutex d_mutex;
     std::condition_variable d_condition;
-    std::deque<Order> d_queue;
+    std::deque<std::shared_ptr<Order>> d_queue;
 public:
-    void pushOrder(Order &value);
+    void pushOrder(std::shared_ptr<Order> &value);
 
-    Order popOrder(std::unique_lock<std::mutex> &lock);
+    std::shared_ptr<Order> popOrder(std::unique_lock<std::mutex> &lock);
 
     bool isEmpty();
 
@@ -217,7 +218,7 @@ public:
         machine->returnProduct(std::move(product));
     }
 
-    ~MachineWrapper() {
+    void joinMachineWorker() {
         if (worker.joinable()) {
             worker.join();
         }
@@ -303,12 +304,12 @@ class CoasterPager {
     friend class System;
 
 private:
-    Order &order;
+    std::shared_ptr<Order> order;
 
-    explicit CoasterPager(Order &order) :
+    explicit CoasterPager(std::shared_ptr<Order> &order) :
             order(order) {}
 
-    Order &getOrder() { return order; }
+    std::shared_ptr<Order> getOrder() { return order; }
 
 public:
 
@@ -316,9 +317,9 @@ public:
 
     void wait(unsigned int timeout) const;
 
-    [[nodiscard]] unsigned int getId() const { return order.getId(); };
+    [[nodiscard]] unsigned int getId() const { return order->getId(); };
 
-    [[nodiscard]] bool isReady() const { return order.isReady(); };
+    [[nodiscard]] bool isReady() const { return order->isReady(); };
 };
 
 class System {
@@ -339,7 +340,7 @@ private:
     std::atomic_bool systemOpen;
 
     OrderSynchronizer orderSynchronizer;
-    std::map<size_t, Order> orders;
+    std::map<size_t, std::shared_ptr<Order>> orders;
     OrderQueue orderQueue;
     std::map<size_t, CoasterPager> pagers;
 
