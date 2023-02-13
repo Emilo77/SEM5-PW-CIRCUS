@@ -77,9 +77,9 @@ Raport pracownika jest strukturą zawierającą następujące pola:
 Urządzenia powiadamiające są instancjami klasy `CoasterPager`.
 `CoasterPager` udostępnia 4 metody:
 
-- `wait()` -- która blokuje, do czasu aż zamówienie będzie gotowe, a w przypadku awarii
+- `waitForOrder()` -- która blokuje, do czasu aż zamówienie będzie gotowe, a w przypadku awarii
   podnosi `FulfillmentFailure`.
-- `wait(timeout)` -- j.w. ale blokuje maksymalnie na `timeout ms`.
+- `waitForOrder(timeout)` -- j.w. ale blokuje maksymalnie na `timeout ms`.
 - `getId` -- zwracająca unikatowy numer zamówienia. Numery zamówień powinny odpowiadać kolejności
   ich złożenia, t.j. jeżeli klient złożył zamówienie `A`, a potem zamówienie `B`, to `A` powinno
   mieć mniejszy numer niż `B`.
