@@ -1,12 +1,6 @@
 #include <algorithm>
 #include "system.hpp"
 
-void print2(std::string s) {
-    std::cout << std::this_thread::get_id() << ": " << s << std::endl;
-}
-
-typedef std::promise<std::unique_ptr<Product>> product_promise_t;
-typedef std::future<std::unique_ptr<Product>> product_future_t;
 
 void Order::waitForOrder() {
     std::unique_lock<std::mutex> lock(*orderInfoMutex);
@@ -167,54 +161,54 @@ void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
 
 void OrderQueue::pushOrder(std::shared_ptr<Order> order) {
     {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_front(order);
+        std::unique_lock<std::mutex> lock(queMutex);
+        que.push(std::move(order));
     }
-    d_condition.notify_one();
+    queCondition.notify_one();
 }
 
 std::shared_ptr<Order>
 OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
 &systemOpen) {
     /* Zakładamy, że lock zostanie ustawiony przed wywołaniem funkcji. */
-    d_condition.wait(lock, [this, &systemOpen] {
-        return (!d_queue.empty() || !systemOpen);
+    queCondition.wait(lock, [this, &systemOpen] {
+        return (!que.empty() || !systemOpen);
     });
-    if (d_queue.empty()) {
+    if (que.empty()) {
         return nullptr;
     }
-    std::shared_ptr<Order> order(std::move(d_queue.back()));
-    d_queue.pop_back();
+    std::shared_ptr<Order> order(std::move(que.back()));
+    que.pop();
 
     return order;
 }
 
 bool OrderQueue::isEmpty() {
-    std::unique_lock<std::mutex> lock(d_mutex);
-    return d_queue.empty();
+    std::unique_lock<std::mutex> lock(queMutex);
+    return que.empty();
 }
 
 
 void MachineQueue::pushPromise(product_promise_t value) {
     {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_back(std::move(value));
+        std::unique_lock<std::mutex> lock(queMutex);
+        que.push(std::move(value));
     }
-    d_condition.notify_one();
+    queCondition.notify_one();
 }
 
 
 std::optional<product_promise_t> MachineQueue::popPromise(std::atomic_bool
                                                           &orderWorkersEnded) {
-    std::unique_lock<std::mutex> lock(d_mutex);
-    d_condition.wait(lock, [this, &orderWorkersEnded] {
-        return (!d_queue.empty() || orderWorkersEnded);
+    std::unique_lock<std::mutex> lock(queMutex);
+    queCondition.wait(lock, [this, &orderWorkersEnded] {
+        return (!que.empty() || orderWorkersEnded);
     });
-    if (orderWorkersEnded && d_queue.empty()) {
+    if (orderWorkersEnded && que.empty()) {
         return {};
     }
-    product_promise_t promiseProduct(std::move(d_queue.back()));
-    d_queue.pop_front();
+    product_promise_t promiseProduct(std::move(que.back()));
+    que.pop();
 
     return promiseProduct;
 }
@@ -290,7 +284,7 @@ System::System(machines_t machines,
         systemOpen(true),
         orderWorkersEnded(false) {
 
-    //map all elements of machines to wrappers and initialize them
+    /* Przechowywanie maszyn we wrapperach. */
     for (auto machine: machines) {
         this->machines.emplace(machine.first,
                                std::make_shared<MachineWrapper>(
@@ -299,6 +293,7 @@ System::System(machines_t machines,
                                        orderWorkersEnded));
     }
 
+    /* Dodanie menu. */
     for (auto &machine: machines) {
         menu.emplace(machine.first);
     }

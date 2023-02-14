@@ -12,11 +12,14 @@
 #include <deque>
 #include <optional>
 #include <map>
-
-using std::cout, std::endl;
+#include <queue>
 
 #include "machine.hpp"
 
+using std::cout, std::endl;
+
+typedef std::promise<std::unique_ptr<Product>> product_promise_t;
+typedef std::future<std::unique_ptr<Product>> product_future_t;
 
 class FulfillmentFailure : public std::exception {
 };
@@ -162,9 +165,9 @@ public:
 
 class OrderQueue {
 private:
-    std::mutex d_mutex;
-    std::condition_variable d_condition;
-    std::deque<std::shared_ptr<Order>> d_queue;
+    std::mutex queMutex;
+    std::condition_variable queCondition;
+    std::queue<std::shared_ptr<Order>> que;
 public:
 
     void pushOrder(std::shared_ptr<Order> value);
@@ -174,24 +177,24 @@ public:
 
     bool isEmpty();
 
-    void notifyShutdown() { d_condition.notify_all(); }
+    void notifyShutdown() { queCondition.notify_all(); }
 
-    std::mutex &getMutex() { return d_mutex; }
+    std::mutex &getMutex() { return queMutex; }
 };
 
 
 class MachineQueue {
 private:
     typedef std::promise<std::unique_ptr<Product>> product_promise_t;
-    std::mutex d_mutex;
-    std::condition_variable d_condition;
-    std::deque<product_promise_t> d_queue;
+    std::mutex queMutex;
+    std::condition_variable queCondition;
+    std::queue<product_promise_t> que;
 public:
     void pushPromise(product_promise_t value);
 
     std::optional<product_promise_t> popPromise(std::atomic_bool &ended);
 
-    void notify() {d_condition.notify_all(); }
+    void notify() { queCondition.notify_all(); }
 };
 
 
