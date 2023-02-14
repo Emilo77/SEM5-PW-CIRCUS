@@ -20,6 +20,7 @@ using std::cout, std::endl;
 
 typedef std::promise<std::unique_ptr<Product>> product_promise_t;
 typedef std::future<std::unique_ptr<Product>> product_future_t;
+typedef std::shared_ptr<product_promise_t> promise_ptr;
 
 class FulfillmentFailure : public std::exception {
 };
@@ -72,6 +73,7 @@ private:
     OrderStatus status;
     std::chrono::time_point<std::chrono::system_clock> doneTime;
     std::shared_ptr<std::mutex> orderInfoMutex;
+    std::shared_ptr<std::mutex> orderStatusMutex;
     std::shared_ptr<std::condition_variable> clientNotifier;
     std::shared_ptr<std::condition_variable> workerNotifier;
 public:
@@ -83,6 +85,7 @@ public:
             products(products),
             status(NOT_DONE),
             orderInfoMutex(std::make_shared<std::mutex>()),
+            orderStatusMutex(std::make_shared<std::mutex>()),
             clientNotifier(std::make_shared<std::condition_variable>()),
             workerNotifier(std::make_shared<std::condition_variable>()) {}
 
@@ -124,7 +127,8 @@ public:
 
     void setStatusLocked(OrderStatus newStatus);
 
-    std::shared_ptr<std::mutex> getMutex() { return orderInfoMutex; }
+    std::shared_ptr<std::mutex> getInfoMutex() { return orderInfoMutex; }
+    std::shared_ptr<std::mutex> getStatusMutex() { return orderStatusMutex; }
 };
 
 
@@ -189,11 +193,11 @@ private:
     typedef std::promise<std::unique_ptr<Product>> product_promise_t;
     std::mutex queMutex;
     std::condition_variable queCondition;
-    std::queue<product_promise_t> que;
+    std::queue<promise_ptr> que;
 public:
-    void pushPromise(product_promise_t value);
+    void pushPromise(promise_ptr value);
 
-    std::optional<product_promise_t> popPromise(std::atomic_bool &ended);
+    std::optional<promise_ptr> popPromise(std::atomic_bool &ended);
 
     void notify() { queCondition.notify_all(); }
 };
@@ -224,7 +228,7 @@ public:
         worker = std::thread([this] { machineWorker(); });
     }
 
-    void insertToQueue(std::promise<std::unique_ptr<Product>> promise) {
+    void insertToQueue(promise_ptr promise) {
         machineQueue.pushPromise(std::move(promise));
     }
 
@@ -254,20 +258,6 @@ private:
     }
 
     void machineWorker();
-};
-
-class OrderSynchronizer {
-private:
-    typedef std::future<std::unique_ptr<Product>> product_future_t;
-    std::condition_variable condition;
-    std::mutex mutex;
-
-public:
-    /* Zakładamy, że wszystkie nazwy produktów w zamówieniu są poprawne. */
-    std::vector<std::pair<std::string, product_future_t>>
-    insertOrderToMachines(Order &order,
-                          std::unordered_map<std::string,
-                                  std::shared_ptr<MachineWrapper>> &machines);
 };
 
 class CoasterPager {
@@ -313,7 +303,6 @@ private:
     std::set<std::string> menu;
     mutable std::mutex menuMutex;
 
-    OrderSynchronizer orderSynchronizer;
     std::map<size_t, std::shared_ptr<Order>> orders;
     mutable std::mutex ordersMapMutex;
     mutable std::mutex newOrderMutex;
@@ -321,6 +310,7 @@ private:
     OrderQueue orderQueue;
 
     std::vector<std::thread> orderWorkers;
+    mutable std::mutex workerReportsMutex;
     std::vector<WorkerReport> workerReports;
     std::atomic_bool orderWorkersEnded;
 

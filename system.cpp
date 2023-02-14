@@ -4,9 +4,7 @@
 
 void Order::waitForOrder() {
     std::unique_lock<std::mutex> lock(*orderInfoMutex);
-    cout << "klient czeka na lock\n";
     clientNotifier->wait(lock, [this] { return status != NOT_DONE; });
-    cout << "klient kończy czekanie na lock\n";
 
     if (status != READY) {
         throw FulfillmentFailure();
@@ -132,15 +130,11 @@ Order::tryToCollectOrder() {
         case Order::OTHER:
             throw BadPagerException();
         case Order::READY: {
-            if (readyProducts.empty()) {
-                exit(420);
-            } else {
-                /* Zwrócenie produktów klientowi. */
-                auto result = collectReadyProducts();
-                lock.unlock();
-                notifyWorker();
-                return result;
-            }
+            /* Zwrócenie produktów klientowi. */
+            auto result = collectReadyProducts();
+            lock.unlock();
+            notifyWorker();
+            return result;
         }
     }
     throw BadPagerException();
@@ -180,7 +174,7 @@ OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
     if (que.empty()) {
         return {};
     }
-    std::shared_ptr<Order> order(std::move(que.back()));
+    std::shared_ptr<Order> order(std::move(que.front()));
     que.pop();
 
     return order;
@@ -192,16 +186,16 @@ bool OrderQueue::isEmpty() {
 }
 
 
-void MachineQueue::pushPromise(product_promise_t value) {
+void MachineQueue::pushPromise(promise_ptr value) {
     {
         std::unique_lock<std::mutex> lock(queMutex);
-        que.push(std::move(value));
+        que.emplace(std::move(value));
     }
     queCondition.notify_one();
 }
 
 
-std::optional<product_promise_t> MachineQueue::popPromise(std::atomic_bool
+std::optional<promise_ptr> MachineQueue::popPromise(std::atomic_bool
                                                           &orderWorkersEnded) {
     std::unique_lock<std::mutex> lock(queMutex);
     queCondition.wait(lock, [this, &orderWorkersEnded] {
@@ -210,7 +204,7 @@ std::optional<product_promise_t> MachineQueue::popPromise(std::atomic_bool
     if (orderWorkersEnded && que.empty()) {
         return {};
     }
-    product_promise_t promiseProduct(std::move(que.back()));
+    auto promiseProduct = que.front();
     que.pop();
 
     return promiseProduct;
@@ -228,7 +222,8 @@ void MachineWrapper::machineWorker() {
         /* Sytuacja, w której wyszliśmy z czekania z kolejki, bo wszyscy
          * pracownicy od zamówień skończyli pracę i nie ma już żadnej
          * pracy do wykonania. */
-        if (!promiseProductOption.has_value()) {
+        if (!promiseProductOption.has_value() ||
+                (promiseProductOption.value() == nullptr)) {
             break;
         }
 
@@ -236,17 +231,17 @@ void MachineWrapper::machineWorker() {
             startMachine();
         }
 
+        auto promiseProduct = promiseProductOption.value();
+
         try {
-            auto product = machine->getProduct();
-            cout << "Przed promisem set_value\n";
-            promiseProductOption.value().set_value(std::move(product));
-            cout << "Po promisie set_value\n";
+            auto p = machine->getProduct();
+            promiseProduct->set_value(std::move(p));
 
         } catch (MachineFailure &e) {
-            promiseProductOption.value().set_exception(
-                    std::current_exception());
+            promiseProduct->set_exception(std::current_exception());
         } catch (const std::future_error &e) {
             cout << "Promise set_value(): " << e.what() << "\n";
+            exit(1);
         }
     }
 
@@ -273,7 +268,7 @@ System::System(machines_t machines,
         orderWorkersEnded(false) {
 
     /* Przechowywanie maszyn we wrapperach. */
-    for (auto machine: machines) {
+    for (auto &machine: machines) {
         this->machines.emplace(machine.first,
                                std::make_shared<MachineWrapper>(
                                        machine.first,
@@ -341,7 +336,9 @@ std::vector<unsigned int> System::getPendingOrders() const {
             if (element.second->checkIfPending()) {
                 pendingOrders.push_back(element.second->getId());
             }
+            cout << element.second->getStatus() << " ";
         }
+        cout << "\n";
     }
 
     return pendingOrders;
@@ -404,6 +401,7 @@ void System::orderWorker() {
         /* Zablokowanie kolejki zamówień. */
         std::unique_lock<std::mutex> lock(orderQueue.getMutex());
 
+
         /* Odebranie zamówienia z kolejki blokującej. */
         auto orderOption = orderQueue.popOrder(lock, systemOpen);
 
@@ -419,12 +417,12 @@ void System::orderWorker() {
         std::vector<std::pair<std::string, product_future_t>> futureProducts;
 
         {
-            std::unique_lock<std::mutex> orderMutex(*(order->getMutex()));
+            std::unique_lock<std::mutex> orderMutex(*(order->getInfoMutex()));
 
             for (const auto &productName: order->getProductNames()) {
-                product_promise_t newPromise;
-                auto future = newPromise.get_future();
-                futureProducts.emplace_back(productName, std::move(future));
+                auto newPromise = std::make_shared<product_promise_t>();
+
+                futureProducts.emplace_back(productName, newPromise->get_future());
                 machines.at(productName)->insertToQueue(std::move(newPromise));
             }
         }
@@ -452,10 +450,11 @@ void System::orderWorker() {
                 infoUpdater.updateFailedProduct(productName);
             } catch (std::future_error &e) {
                 cout << "odbieranie future: " << e.what() << endl;
+                exit(1);
             }
         }
 
-        std::unique_lock<std::mutex> orderLock(*(order->getMutex()));
+        std::unique_lock<std::mutex> orderLock(*(order->getInfoMutex()));
 
         if (order->getStatus() == Order::BROKEN_MACHINE) {
             infoUpdater.updateOrder(*order, WorkerReportUpdater::FAIL);
@@ -475,7 +474,10 @@ void System::orderWorker() {
 
     }
 
-    infoUpdater.addReport(workerReports);
+    {
+        std::unique_lock<std::mutex> workerReportsLock(workerReportsMutex);
+        infoUpdater.addReport(workerReports);
+    }
 }
 
 
