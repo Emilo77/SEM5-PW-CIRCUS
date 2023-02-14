@@ -16,8 +16,6 @@
 
 #include "machine.hpp"
 
-using std::cout, std::endl;
-
 typedef std::promise<std::unique_ptr<Product>> product_promise_t;
 typedef std::future<std::unique_ptr<Product>> product_future_t;
 typedef std::shared_ptr<product_promise_t> promise_ptr;

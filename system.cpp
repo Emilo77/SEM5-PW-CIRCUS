@@ -61,6 +61,7 @@ std::vector<std::unique_ptr<Product>> Order::collectReadyProducts() {
     for (auto &namedProduct: readyProducts) {
         achievedProducts.push_back(std::move(namedProduct.second));
     }
+    setStatus(RECEIVED);
     /* Wyczyszczenie kontenera na produkty. */
     readyProducts.clear();
 
@@ -239,9 +240,6 @@ void MachineWrapper::machineWorker() {
 
         } catch (MachineFailure &e) {
             promiseProduct->set_exception(std::current_exception());
-        } catch (const std::future_error &e) {
-            cout << "Promise set_value(): " << e.what() << "\n";
-            exit(1);
         }
     }
 
@@ -290,6 +288,9 @@ System::System(machines_t machines,
 std::vector<WorkerReport> System::shutdown() {
     {
         std::unique_lock<std::mutex> orderQueueLock(orderQueue.getMutex());
+        if(!systemOpen) {
+            return workerReports;
+        }
         systemOpen = false;
     }
 
@@ -336,9 +337,7 @@ std::vector<unsigned int> System::getPendingOrders() const {
             if (element.second->checkIfPending()) {
                 pendingOrders.push_back(element.second->getId());
             }
-            cout << element.second->getStatus() << " ";
         }
-        cout << "\n";
     }
 
     return pendingOrders;
@@ -371,10 +370,10 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
 
 std::vector<std::unique_ptr<Product>>
 System::collectOrder(std::unique_ptr<CoasterPager> pager) {
-    std::unique_lock<std::mutex> lock(collectOrderMutex);
+
+    std::unique_lock<std::mutex> collectLock(collectOrderMutex);
     try {
         return pager->order->tryToCollectOrder();
-
     } catch (...) {
         throw;
     }
@@ -448,9 +447,6 @@ void System::orderWorker() {
                 order->setStatusLocked(Order::BROKEN_MACHINE);
                 order->notifyClient();
                 infoUpdater.updateFailedProduct(productName);
-            } catch (std::future_error &e) {
-                cout << "odbieranie future: " << e.what() << endl;
-                exit(1);
             }
         }
 
@@ -465,13 +461,13 @@ void System::orderWorker() {
 
         } else {
             order->markOrderDone(readyProducts);
+
             orderLock.unlock();
             /* Powiadomienie klienta czekającego na funkcjach z pager'a. */
             order->notifyClient();
 
             order->waitForClient(infoUpdater, machines);
         }
-
     }
 
     {
