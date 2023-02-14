@@ -4,7 +4,10 @@
 
 void Order::waitForOrder() {
     std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    cout << "klient czeka na lock\n";
     clientNotifier->wait(lock, [this] { return status != NOT_DONE; });
+    cout << "klient kończy czekanie na lock\n";
+
     if (status != READY) {
         throw FulfillmentFailure();
     }
@@ -162,12 +165,12 @@ void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
 void OrderQueue::pushOrder(std::shared_ptr<Order> order) {
     {
         std::unique_lock<std::mutex> lock(queMutex);
-        que.push(std::move(order));
+        que.emplace(std::move(order));
     }
     queCondition.notify_one();
 }
 
-std::shared_ptr<Order>
+std::optional<std::shared_ptr<Order>>
 OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
 &systemOpen) {
     /* Zakładamy, że lock zostanie ustawiony przed wywołaniem funkcji. */
@@ -175,7 +178,7 @@ OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
         return (!que.empty() || !systemOpen);
     });
     if (que.empty()) {
-        return nullptr;
+        return {};
     }
     std::shared_ptr<Order> order(std::move(que.back()));
     que.pop();
@@ -240,7 +243,8 @@ void MachineWrapper::machineWorker() {
             cout << "Po promisie set_value\n";
 
         } catch (MachineFailure &e) {
-            promiseProductOption.value().set_exception(std::current_exception());
+            promiseProductOption.value().set_exception(
+                    std::current_exception());
         } catch (const std::future_error &e) {
             cout << "Promise set_value(): " << e.what() << "\n";
         }
@@ -251,22 +255,6 @@ void MachineWrapper::machineWorker() {
     }
 }
 
-std::vector<std::pair<std::string, product_future_t>>
-OrderSynchronizer::insertOrderToMachines(Order &order,
-                                         std::unordered_map<std::string,
-                                                 std::shared_ptr<MachineWrapper>> &machines) {
-
-    std::unique_lock<std::mutex> lock(*order.getMutex());
-
-    std::vector<std::pair<std::string, product_future_t>> futureProducts;
-    for (const auto &productName: order.getProductNames()) {
-        product_promise_t newPromise;
-        auto future = newPromise.get_future();
-        futureProducts.emplace_back(productName, std::move(future));
-        machines.at(productName)->insertToQueue(std::move(newPromise));
-    }
-    return futureProducts;
-}
 
 void System::removeFromMenu(std::string &product) {
     std::unique_lock<std::mutex> lock(menuMutex);
@@ -417,17 +405,29 @@ void System::orderWorker() {
         std::unique_lock<std::mutex> lock(orderQueue.getMutex());
 
         /* Odebranie zamówienia z kolejki blokującej. */
-        auto orderPtr = orderQueue.popOrder(lock, systemOpen);
+        auto orderOption = orderQueue.popOrder(lock, systemOpen);
 
         /* Sytuacja zamknięcia systemu. */
-        if (orderPtr == nullptr) {
+        if (!orderOption.has_value()) {
             lock.unlock();
             break;
         }
 
+        auto order = orderOption->get();
+
         /* Zlecenie maszynom wyprodukowanie produktów. */
-        auto futureProducts = orderSynchronizer.insertOrderToMachines(
-                *orderPtr, machines);
+        std::vector<std::pair<std::string, product_future_t>> futureProducts;
+
+        {
+            std::unique_lock<std::mutex> orderMutex(*(order->getMutex()));
+
+            for (const auto &productName: order->getProductNames()) {
+                product_promise_t newPromise;
+                auto future = newPromise.get_future();
+                futureProducts.emplace_back(productName, std::move(future));
+                machines.at(productName)->insertToQueue(std::move(newPromise));
+            }
+        }
 
         /* Odblokowanie kolejki zamówień. */
         lock.unlock();
@@ -439,9 +439,7 @@ void System::orderWorker() {
         for (auto &futureProduct: futureProducts) {
             std::string productName = futureProduct.first;
             try {
-                cout << "Przed pobraniem wyniku get\n";
                 auto product = futureProduct.second.get();
-                cout << "Po pobraniu wyniku get\n";
 
                 /* Jeżeli wyprodukowanie powiodło się, dodanie do kontenera.*/
                 readyProducts.emplace_back(productName, std::move(product));
@@ -449,30 +447,30 @@ void System::orderWorker() {
             } catch (MachineFailure &e) {
                 removeFromMenu(productName);
                 /* W przypadku awarii maszyny, zaznaczenie informacji. */
-                orderPtr->setStatusLocked(Order::BROKEN_MACHINE);
-                orderPtr->notifyClient();
+                order->setStatusLocked(Order::BROKEN_MACHINE);
+                order->notifyClient();
                 infoUpdater.updateFailedProduct(productName);
             } catch (std::future_error &e) {
                 cout << "odbieranie future: " << e.what() << endl;
             }
         }
 
-        std::unique_lock<std::mutex> orderLock(*(orderPtr->getMutex()));
+        std::unique_lock<std::mutex> orderLock(*(order->getMutex()));
 
-        if (orderPtr->getStatus() == Order::BROKEN_MACHINE) {
-            infoUpdater.updateOrder(*orderPtr, WorkerReportUpdater::FAIL);
+        if (order->getStatus() == Order::BROKEN_MACHINE) {
+            infoUpdater.updateOrder(*order, WorkerReportUpdater::FAIL);
             /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
-            orderPtr->returnProducts(machines);
+            order->returnProducts(machines);
             orderLock.unlock();
-            orderPtr->notifyClient();
+            order->notifyClient();
 
         } else {
-            orderPtr->markOrderDone(readyProducts);
+            order->markOrderDone(readyProducts);
             orderLock.unlock();
             /* Powiadomienie klienta czekającego na funkcjach z pager'a. */
-            orderPtr->notifyClient();
+            order->notifyClient();
 
-            orderPtr->waitForClient(infoUpdater, machines);
+            order->waitForClient(infoUpdater, machines);
         }
 
     }

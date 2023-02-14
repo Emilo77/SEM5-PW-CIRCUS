@@ -172,7 +172,8 @@ public:
 
     void pushOrder(std::shared_ptr<Order> value);
 
-    std::shared_ptr<Order> popOrder(std::unique_lock<std::mutex> &lock,
+    std::optional<std::shared_ptr<Order>>
+    popOrder(std::unique_lock<std::mutex> &lock,
                                     std::atomic_bool &systemOpen);
 
     bool isEmpty();
