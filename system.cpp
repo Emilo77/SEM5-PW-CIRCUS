@@ -79,11 +79,6 @@ void Order::returnProducts(machine_wrappers_t &machines) {
     readyProducts.clear();
 }
 
-size_t Order::getId() const {
-//    std::unique_lock<std::mutex> lock(*orderInfoMutex);
-    return id;
-}
-
 std::vector<std::string> Order::getProductNames() {
     return products;
 }
@@ -105,7 +100,6 @@ bool Order::checkIfPending() {
 }
 
 Order::OrderStatus Order::getStatus() {
-    std::unique_lock<std::mutex> lock(*orderInfoMutex);
     return status;
 }
 
@@ -151,6 +145,7 @@ Order::tryToCollectOrder() {
             }
         }
     }
+    throw BadPagerException();
 }
 
 void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
@@ -171,7 +166,7 @@ void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
 void OrderQueue::pushOrder(std::shared_ptr<Order> order) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
-        d_queue.push_back(order);
+        d_queue.push_front(order);
     }
     d_condition.notify_one();
 }
@@ -187,7 +182,7 @@ OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
         return nullptr;
     }
     std::shared_ptr<Order> order(std::move(d_queue.back()));
-    d_queue.pop_front();
+    d_queue.pop_back();
 
     return order;
 }
@@ -440,6 +435,7 @@ void System::orderWorker() {
         /* Zlecenie maszynom wyprodukowanie produktów. */
         auto futureProducts = orderSynchronizer.insertOrderToMachines(
                 *orderPtr, machines);
+
         /* Odblokowanie kolejki zamówień. */
         lock.unlock();
 
@@ -464,18 +460,18 @@ void System::orderWorker() {
             }
         }
 
-        lock.lock();
+        std::unique_lock<std::mutex> orderLock(*(orderPtr->getMutex()));
 
         if (orderPtr->getStatus() == Order::BROKEN_MACHINE) {
             infoUpdater.updateOrder(*orderPtr, WorkerReportUpdater::FAIL);
             /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
             orderPtr->returnProducts(machines);
-            lock.unlock();
+            orderLock.unlock();
             orderPtr->notifyClient();
 
         } else {
             orderPtr->markOrderDone(readyProducts);
-            lock.unlock();
+            orderLock.unlock();
             /* Powiadomienie klienta czekającego na funkcjach z pager'a. */
             orderPtr->notifyClient();
 

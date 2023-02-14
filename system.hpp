@@ -105,7 +105,7 @@ public:
 
     void returnProducts(machine_wrappers_t &machines);
 
-    [[nodiscard]] size_t getId() const;
+    [[nodiscard]] size_t getId() const { return id; }
 
     [[nodiscard]] bool isReady();
 
@@ -120,6 +120,8 @@ public:
     void setStatus(OrderStatus newStatus) { status = newStatus; }
 
     void setStatusLocked(OrderStatus newStatus);
+
+    std::shared_ptr<std::mutex> getMutex() { return orderInfoMutex; }
 };
 
 
