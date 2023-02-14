@@ -6,34 +6,33 @@
 
 #include "system.hpp"
 
-template <typename T, typename V>
-bool checkType(const V* v) {
-    return dynamic_cast<const T*>(v) != nullptr;
+void print(std::string s) {
+    std::cout << std::this_thread::get_id() << ": " << s << std::endl;
 }
 
-class Burger : public Product
-{
+
+template<typename T, typename V>
+bool checkType(const V *v) {
+    return dynamic_cast<const T *>(v) != nullptr;
+}
+
+class Burger : public Product {
 };
 
-class IceCream : public Product
-{
+class IceCream : public Product {
 };
 
-class Chips : public Product
-{
+class Chips : public Product {
 };
 
-class BurgerMachine : public Machine
-{
+class BurgerMachine : public Machine {
     std::atomic_uint burgersMade;
     std::chrono::seconds time = std::chrono::seconds(1);
 public:
     BurgerMachine() : burgersMade(0) {}
 
-    std::unique_ptr<Product> getProduct()
-    {
-        if (burgersMade > 0)
-        {
+    std::unique_ptr<Product> getProduct() {
+        if (burgersMade > 0) {
             burgersMade--;
             return std::unique_ptr<Product>(new Burger());
         } else {
@@ -42,30 +41,25 @@ public:
         }
     }
 
-    void returnProduct(std::unique_ptr<Product> product)
-    {
+    void returnProduct(std::unique_ptr<Product> product) {
         if (!checkType<Burger>(product.get())) throw BadProductException();
         burgersMade++;
     }
 
-    void start()
-    {
+    void start() {
         burgersMade.store(10);
     }
 
     void stop() {}
 };
 
-class IceCreamMachine : public Machine
-{
+class IceCreamMachine : public Machine {
 public:
-    std::unique_ptr<Product> getProduct()
-    {
+    std::unique_ptr<Product> getProduct() {
         throw MachineFailure();
     }
 
-    void returnProduct(std::unique_ptr<Product> product)
-    {
+    void returnProduct(std::unique_ptr<Product> product) {
         if (!checkType<IceCream>(product.get())) throw BadProductException();
     }
 
@@ -74,8 +68,7 @@ public:
     void stop() {}
 };
 
-class ChipsMachine : public Machine
-{
+class ChipsMachine : public Machine {
     std::thread thread;
     std::mutex mutex;
     std::condition_variable cond;
@@ -85,38 +78,34 @@ class ChipsMachine : public Machine
 public:
     ChipsMachine() : running(false) {}
 
-    std::unique_ptr<Product> getProduct()
-    {
+    std::unique_ptr<Product> getProduct() {
         if (!running) throw MachineNotWorking();
         wcount++;
         std::unique_lock<std::mutex> lock(mutex);
-        cond.wait(lock, [this](){ return !queue.empty(); });
+        cond.wait(lock, [this]() { return !queue.empty(); });
         wcount--;
         auto product = std::move(queue.front());
-        queue.pop_back();
+        queue.pop_front();
         return product;
     }
 
-    void returnProduct(std::unique_ptr<Product> product)
-    {
+    void returnProduct(std::unique_ptr<Product> product) {
         if (!checkType<Chips>(product.get())) throw BadProductException();
         if (!running) throw MachineNotWorking();
         std::lock_guard<std::mutex> lock(mutex);
-        queue.push_front((std::unique_ptr<Chips>&&) (std::move(product)));
+        queue.push_front((std::unique_ptr<Chips> &&) (std::move(product)));
         cond.notify_one();
     }
 
-    void start()
-    {
+    void start() {
         running = true;
-        thread = std::thread([this](){
-            while (running || wcount > 0)
-            {
+        thread = std::thread([this]() {
+            while (running || wcount > 0) {
                 int count = 7;
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 {
                     std::lock_guard<std::mutex> lock(mutex);
-                    while (count --> 0) {
+                    while (count-- > 0) {
                         queue.push_back(std::unique_ptr<Chips>(new Chips()));
                         cond.notify_one();
                     }
@@ -125,8 +114,7 @@ public:
         });
     }
 
-    void stop()
-    {
+    void stop() {
         running = false;
         thread.join();
     }
@@ -137,30 +125,45 @@ int main() {
     System system{
             {
                     {"burger", std::shared_ptr<Machine>(new BurgerMachine())},
-                    {"iceCream", std::shared_ptr<Machine>(new IceCreamMachine())},
+                    {"iceCream",
+                     std::shared_ptr<Machine>(new IceCreamMachine())},
                     {"chips", std::shared_ptr<Machine>(new ChipsMachine())},
             },
             10,
-            1
+            100
     };
 
     auto client1 = std::thread([&system]() {
         system.getMenu();
-        auto p = system.order({"burger", "chips"});
-        p->wait();
-        system.collectOrder(std::move(p));
-        std::cout << "OK\n";
+        try {
+            auto p = system.order({"burger", "chips"});
+
+            print("client1 rozpoczyna czekanie\n");
+            p->wait();
+            print("client1 kończy czekanie\n");
+
+            system.collectOrder(std::move(p));
+            std::cout << "OK burger chips 1\n";
+        } catch (BadOrderException &e) {
+            std::cout << "WESZŁO DO WYJĄTKU\n";
+        }
     });
 
-    auto client2 = std::thread([&system](){
+    auto client2 = std::thread([&system]() {
         system.getMenu();
         system.getPendingOrders();
         try {
             auto p = system.order({"iceCream", "chips"});
+
+            print("client2 rozpoczyna czekanie\n");
             p->wait();
+            print("client2 kończy czekanie\n");
+
             system.collectOrder(std::move(p));
-        } catch (const FulfillmentFailure& e) {
-            std::cout << "OK\n";
+        } catch (const FulfillmentFailure &e) {
+            std::cout << "OK iceCream, chips\n";
+        } catch (const BadOrderException &e) {
+            std::cout << "OK iceCream, chips\n";
         }
     });
 
@@ -169,17 +172,40 @@ int main() {
     client2.join();
 
     system.shutdown();
+    std::cout << "system zamknięty\n";
 
-    auto client3 = std::thread([&system](){
+
+    auto client3 = std::thread([&system]() {
         system.getMenu();
+        print("client3 sprawdził menu");
         system.getPendingOrders();
+        print("client3 sprawdził pendingOrders");
         try {
             auto p = system.order({"burger", "chips"});
+            print("client3 złożył zamówienie");
+            print("client3 zaczyna czekanie");
             p->wait();
+            print("client3 kończy czekanie");
+
             system.collectOrder(std::move(p));
-        } catch (const RestaurantClosedException& e) {
-            std::cout << "OK\n";
+        } catch (const RestaurantClosedException &e) {
+            std::cout << "OK burger, chips 2\n";
         }
     });
     client3.join();
+
 }
+
+//int main() {
+//    System system{
+//            {
+//                    {"burger", std::shared_ptr<Machine>(new BurgerMachine())},
+//                    {"iceCream",
+//                     std::shared_ptr<Machine>(new IceCreamMachine())},
+//                    {"chips", std::shared_ptr<Machine>(new ChipsMachine())},
+//            },
+//            10,
+//            100
+//    };
+//    system.shutdown();
+//}
