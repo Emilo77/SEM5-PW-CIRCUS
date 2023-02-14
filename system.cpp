@@ -34,12 +34,12 @@ void Order::waitForClient(WorkerReportUpdater &infoUpdater,
     if (clientCollected) {
         /* Klient pojawił się na czas i odebrał produkty. */
         setStatus(Order::RECEIVED);
-        infoUpdater.updateOrder(*this, WorkerReportUpdater::COLLECT);
+        infoUpdater.updateReport(*this, WorkerReportUpdater::COLLECT);
     } else {
         /* Jeżeli klient nie pojawił się na czas, zmienienie statusu
                  * zamówienia i zwrócenie produktów do maszyn. */
         setStatus(Order::EXPIRED);
-        infoUpdater.updateOrder(*this, WorkerReportUpdater::ABANDON);
+        infoUpdater.updateReport(*this, WorkerReportUpdater::ABANDON);
         returnProducts(machines);
     }
 }
@@ -128,7 +128,6 @@ Order::tryToCollectOrder() {
         case Order::EXPIRED:
             throw OrderExpiredException();
         case Order::RECEIVED:
-        case Order::OTHER:
             throw BadPagerException();
         case Order::READY: {
             /* Zwrócenie produktów klientowi. */
@@ -141,7 +140,7 @@ Order::tryToCollectOrder() {
     throw BadPagerException();
 }
 
-void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
+void WorkerReportUpdater::updateReport(Order &order, ACTION a) {
     switch (a) {
         case FAIL:
             report.failedOrders.push_back(order.getProductNames());
@@ -172,6 +171,8 @@ OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
     queCondition.wait(lock, [this, &systemOpen] {
         return (!que.empty() || !systemOpen);
     });
+    /* Jeżeli kolejka jest pusta i pracownik został obudzony, oznacza to, że
+     * nie ma już więcej pracy do wykonania. */
     if (que.empty()) {
         return {};
     }
@@ -218,6 +219,7 @@ void MachineWrapper::machineWorker() {
         /* Czekamy na kolejce, wyciągamy polecenie wyprodukowania
          * produktu. */
 
+        /* Wyciągnięcie promise'u z kolejki blokującej. */
         auto promiseProductOption = machineQueue.popPromise(orderWorkersEnded);
 
         /* Sytuacja, w której wyszliśmy z czekania z kolejki, bo wszyscy
@@ -446,14 +448,14 @@ void System::orderWorker() {
                 /* W przypadku awarii maszyny, zaznaczenie informacji. */
                 order->setStatusLocked(Order::BROKEN_MACHINE);
                 order->notifyClient();
-                infoUpdater.updateFailedProduct(productName);
+                infoUpdater.updateReport(productName);
             }
         }
 
         std::unique_lock<std::mutex> orderLock(*(order->getInfoMutex()));
 
         if (order->getStatus() == Order::BROKEN_MACHINE) {
-            infoUpdater.updateOrder(*order, WorkerReportUpdater::FAIL);
+            infoUpdater.updateReport(*order, WorkerReportUpdater::FAIL);
             /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
             order->returnProducts(machines);
             orderLock.unlock();
