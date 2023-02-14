@@ -317,6 +317,8 @@ public:
 
 /* Główna klasa reprezentująca system restauracji. */
 class System {
+    typedef std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> machine_wrappers_t;
 private:
     /* Generator id zamówienia. */
     class IdGenerator {
@@ -324,13 +326,6 @@ private:
     public:
         size_t newId() { return id++; }
     };
-
-public:
-    typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
-private:
-    typedef std::unordered_map<std::string,
-            std::shared_ptr<MachineWrapper>> machine_wrappers_t;
-
     IdGenerator idGenerator;
     unsigned int clientTimeout;
     std::atomic_bool systemOpen;
@@ -351,7 +346,17 @@ private:
     std::vector<WorkerReport> workerReports;
     std::atomic_bool orderWorkersEnded;
 
+    /* Sprawdza, czy dany produkt znajduje się w menu. */
+    bool productsInMenu(std::vector<std::string> &products);
+
+    /* Usuwa pozycję z menu. */
+    void removeFromMenu(std::string &product);
+
+    /* Funkcja pracownika kompletującego zamówienia. */
+    void orderWorker();
+
 public:
+    typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
     /* Konstruktor systemu. Opakowuje maszyny we wrappery, uruchamia wątki
      * pracowników, obsługujących zamówienia. */
     System(machines_t machines, unsigned int numberOfWorkers,
@@ -377,15 +382,6 @@ public:
     /* Zwraca maksymalny czas, w jakim można odebrać gotowe zamówienie. */
     unsigned int getClientTimeout() const { return clientTimeout; }
 
-private:
-    /* Sprawdza, czy dany produkt znajduje się w menu. */
-    bool productsInMenu(std::vector<std::string> &products);
-
-    /* Usuwa pozycję z menu. */
-    void removeFromMenu(std::string &product);
-
-    /* Funkcja pracownika kompletującego zamówienia. */
-    void orderWorker();
 };
 
 

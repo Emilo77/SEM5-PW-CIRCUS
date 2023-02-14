@@ -3,8 +3,8 @@ project(PW-CIRCUS)
 
 set(CMAKE_CXX_STANDARD "20")
 
-set(CMAKE_CXX_FLAGS "-std=c++20 -Wall -Wextra -Werror -pedantic -fsanitize=undefined,thread")
-#set(CMAKE_CXX_FLAGS "-std=c++20 -Wall -Wextra -fsanitize=undefined,thread")
+#set(CMAKE_CXX_FLAGS "-std=c++20 -Wall -Wextra -Werror -pedantic -fsanitize=undefined,thread")
+set(CMAKE_CXX_FLAGS "-std=c++20 -Wall -Wextra -Werror -pthread")
 #set(CMAKE_CXX_FLAGS "-std=c++20 -Wall -Wextra")
 
 add_executable(demo
