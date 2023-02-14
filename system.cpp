@@ -30,8 +30,9 @@ void Order::waitForClient(WorkerReportUpdater &infoUpdater,
                           Order::machine_wrappers_t &machines) {
     std::unique_lock<std::mutex> lock(*orderInfoMutex);
 
-    auto clientCollected = workerNotifier->wait_for(lock, std::chrono::milliseconds(
-            timeout), [this] {
+    auto clientCollected = workerNotifier->wait_for(lock,
+                                                    std::chrono::milliseconds(
+                                                            timeout), [this] {
                 return readyProducts.empty();
             });
 
@@ -160,6 +161,7 @@ void WorkerReportUpdater::updateOrder(Order &order, ACTION a) {
             report.abandonedOrders.push_back(order.getProductNames());
             break;
     }
+    actionMade = true;
 }
 
 
@@ -193,7 +195,7 @@ bool OrderQueue::isEmpty() {
 }
 
 
-void MachineQueue::pushPromise(product_promise_t &value) {
+void MachineQueue::pushPromise(product_promise_t value) {
     {
         std::unique_lock<std::mutex> lock(d_mutex);
         d_queue.push_back(std::move(value));
@@ -202,19 +204,19 @@ void MachineQueue::pushPromise(product_promise_t &value) {
 }
 
 
-product_promise_t MachineQueue::popPromise(std::atomic_bool
-                                           &orderWorkersEnded) {
+std::optional<product_promise_t> MachineQueue::popPromise(std::atomic_bool
+                                                          &orderWorkersEnded) {
     std::unique_lock<std::mutex> lock(d_mutex);
     d_condition.wait(lock, [this, &orderWorkersEnded] {
         return (!d_queue.empty() || orderWorkersEnded);
     });
-    if (orderWorkersEnded) {
+    if (orderWorkersEnded && d_queue.empty()) {
         return {};
     }
-    product_promise_t promise(std::move(d_queue.back()));
+    product_promise_t promiseProduct(std::move(d_queue.back()));
     d_queue.pop_front();
 
-    return promise;
+    return promiseProduct;
 }
 
 void MachineWrapper::machineWorker() {
@@ -223,13 +225,13 @@ void MachineWrapper::machineWorker() {
     while (!orderWorkersEnded) {
         /* Czekamy na kolejce, wyciągamy polecenie wyprodukowania
          * produktu. */
-        std::promise<std::unique_ptr<Product>>
-                promise = machineQueue.popPromise(orderWorkersEnded);
+
+        auto promiseProductOption = machineQueue.popPromise(orderWorkersEnded);
 
         /* Sytuacja, w której wyszliśmy z czekania z kolejki, bo wszyscy
          * pracownicy od zamówień skończyli pracę i nie ma już żadnej
          * pracy do wykonania. */
-        if (orderWorkersEnded) {
+        if (!promiseProductOption.has_value()) {
             break;
         }
 
@@ -239,10 +241,14 @@ void MachineWrapper::machineWorker() {
 
         try {
             auto product = machine->getProduct();
-            promise.set_value(std::move(product));
+            cout << "Przed promisem set_value\n";
+            promiseProductOption.value().set_value(std::move(product));
+            cout << "Po promisie set_value\n";
 
         } catch (MachineFailure &e) {
-            promise.set_exception(std::current_exception());
+            promiseProductOption.value().set_exception(std::current_exception());
+        } catch (const std::future_error &e) {
+            cout << "Promise set_value(): " << e.what() << "\n";
         }
     }
 
@@ -256,16 +262,14 @@ OrderSynchronizer::insertOrderToMachines(Order &order,
                                          std::unordered_map<std::string,
                                                  std::shared_ptr<MachineWrapper>> &machines) {
 
-    std::unique_lock<std::mutex> lock(mutex);
+    std::unique_lock<std::mutex> lock(*order.getMutex());
 
     std::vector<std::pair<std::string, product_future_t>> futureProducts;
     for (const auto &productName: order.getProductNames()) {
-
         product_promise_t newPromise;
-        product_future_t newFuture = newPromise.get_future();
-
-        machines.at(productName)->insertToQueue(newPromise);
-        futureProducts.emplace_back(productName, std::move(newFuture));
+        auto future = newPromise.get_future();
+        futureProducts.emplace_back(productName, std::move(future));
+        machines.at(productName)->insertToQueue(std::move(newPromise));
     }
     return futureProducts;
 }
@@ -321,7 +325,7 @@ std::vector<WorkerReport> System::shutdown() {
 
 
     orderWorkersEnded = true;
-    for(auto &machine: machines) {
+    for (auto &machine: machines) {
         machine.second->notifyShutdown();
     }
 
@@ -391,14 +395,8 @@ System::collectOrder(std::unique_ptr<CoasterPager> pager) {
     try {
         return pager->order->tryToCollectOrder();
 
-    } catch (FulfillmentFailure &e) {
-        throw e;
-    } catch (OrderNotReadyException &e) {
-        throw e;
-    } catch (OrderExpiredException &e) {
-        throw e;
-    } catch (BadPagerException &e) {
-        throw e;
+    } catch (...) {
+        throw;
     }
 }
 
@@ -446,7 +444,9 @@ void System::orderWorker() {
         for (auto &futureProduct: futureProducts) {
             std::string productName = futureProduct.first;
             try {
+                cout << "Przed pobraniem wyniku get\n";
                 auto product = futureProduct.second.get();
+                cout << "Po pobraniu wyniku get\n";
 
                 /* Jeżeli wyprodukowanie powiodło się, dodanie do kontenera.*/
                 readyProducts.emplace_back(productName, std::move(product));
@@ -457,6 +457,8 @@ void System::orderWorker() {
                 orderPtr->setStatusLocked(Order::BROKEN_MACHINE);
                 orderPtr->notifyClient();
                 infoUpdater.updateFailedProduct(productName);
+            } catch (std::future_error &e) {
+                cout << "odbieranie future: " << e.what() << endl;
             }
         }
 
@@ -480,7 +482,7 @@ void System::orderWorker() {
 
     }
 
-//    workerReports.push_back(infoUpdater.getReport());
+    infoUpdater.addReport(workerReports);
 }
 
 

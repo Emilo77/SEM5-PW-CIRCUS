@@ -137,6 +137,7 @@ class WorkerReportUpdater {
 
 private:
     struct WorkerReport report;
+    bool actionMade{false};
 public:
     enum ACTION {
         FAIL,
@@ -148,9 +149,14 @@ public:
 
     void updateFailedProduct(std::string &product) {
         report.failedProducts.push_back(product);
+        actionMade = true;
     }
 
-    WorkerReport getReport() { return report; }
+    void addReport(std::vector<WorkerReport> &workerReports) {
+        if (actionMade) {
+            workerReports.push_back(report);
+        }
+    }
 };
 
 
@@ -181,9 +187,9 @@ private:
     std::condition_variable d_condition;
     std::deque<product_promise_t> d_queue;
 public:
-    void pushPromise(product_promise_t &value);
+    void pushPromise(product_promise_t value);
 
-    product_promise_t popPromise(std::atomic_bool &ended);
+    std::optional<product_promise_t> popPromise(std::atomic_bool &ended);
 
     void notify() {d_condition.notify_all(); }
 };
@@ -214,8 +220,8 @@ public:
         worker = std::thread([this] { machineWorker(); });
     }
 
-    void insertToQueue(std::promise<std::unique_ptr<Product>> &promise) {
-        machineQueue.pushPromise(promise);
+    void insertToQueue(std::promise<std::unique_ptr<Product>> promise) {
+        machineQueue.pushPromise(std::move(promise));
     }
 
     void returnProduct(std::unique_ptr<Product> &product) {
