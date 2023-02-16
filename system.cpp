@@ -1,17 +1,261 @@
 #include <algorithm>
 #include "system.hpp"
 
-void System::initializeMachines(machines_t &m) {
-    for (auto &machine: m) {
-        machineStatus.emplace(machine.first, MachineStatus::OFF);
+
+void Order::waitForOrder() {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    clientNotifier->wait(lock, [this] { return status != NOT_DONE; });
+
+    if (status != READY) {
+        throw FulfillmentFailure();
     }
-    mSynchronizer.initialize(m);
+}
+
+void Order::waitForOrderTimed(unsigned int time) {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    clientNotifier->wait_for(lock, std::chrono::milliseconds(time), [this] {
+        return status != NOT_DONE;
+    });
+    if (status != READY) {
+        throw FulfillmentFailure();
+    }
+}
+
+void Order::waitForClient(WorkerReportUpdater &infoUpdater,
+                          Order::machine_wrappers_t &machines) {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+
+    auto clientCollected = workerNotifier->wait_for(lock,
+                                                    std::chrono::milliseconds(
+                                                            timeout), [this] {
+                return readyProducts.empty();
+            });
+
+    if (clientCollected) {
+        /* Klient pojawił się na czas i odebrał produkty. */
+        setStatus(Order::RECEIVED);
+        infoUpdater.updateReport(*this, WorkerReportUpdater::COLLECT);
+    } else {
+        /* Jeżeli klient nie pojawił się na czas, zmienienie statusu
+                 * zamówienia i zwrócenie produktów do maszyn. */
+        setStatus(Order::EXPIRED);
+        infoUpdater.updateReport(*this, WorkerReportUpdater::ABANDON);
+        returnProducts(machines);
+    }
+}
+
+void
+Order::markOrderDone(
+        std::vector<std::pair<std::string, std::unique_ptr<Product>>>
+        &namedProducts) {
+    /* Dodanie produktów do zamówienia, zaktualizowanie statusu. */
+    readyProducts = std::move(namedProducts);
+    doneTime = std::chrono::system_clock::now();
+    status = READY;
+}
+
+std::vector<std::unique_ptr<Product>> Order::collectReadyProducts() {
+    /* Zakładamy, że funkcja wywoływana jest po locku na ochronę klasy. */
+    /* Wyciągnięcie gotowych produktów, ich nazwy są już niepotrzebne. */
+    std::vector<std::unique_ptr<Product>> achievedProducts;
+    for (auto &namedProduct: readyProducts) {
+        achievedProducts.push_back(std::move(namedProduct.second));
+    }
+    setStatus(RECEIVED);
+    /* Wyczyszczenie kontenera na produkty. */
+    readyProducts.clear();
+
+    /* Zwrócenie gotowych produktów. */
+    return achievedProducts;
+}
+
+void Order::returnProducts(machine_wrappers_t &machines) {
+    for (auto &product: readyProducts) {
+        machines.at(product.first)->returnProduct(product.second);
+    }
+    readyProducts.clear();
+}
+
+std::vector<std::string> Order::getProductNames() {
+    return products;
+}
+
+bool Order::isReady() {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    updateIfExpired();
+    return status == READY;
+}
+
+bool Order::checkIfPending() {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+
+    updateIfExpired();
+    if (status == READY || status == NOT_DONE) {
+        return true;
+    }
+    return false;
+}
+
+Order::OrderStatus Order::getStatus() {
+    return status;
+}
+
+void Order::setStatusLocked(OrderStatus newStatus) {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    status = newStatus;
+}
+
+void Order::updateIfExpired() {
+    if (status == READY) {
+        std::chrono::duration<double> elapsedTime =
+                std::chrono::system_clock::now() - doneTime;
+        if (elapsedTime > std::chrono::milliseconds(timeout)) {
+            status = EXPIRED;
+        }
+    }
+}
+
+std::vector<std::unique_ptr<Product>>
+Order::tryToCollectOrder() {
+    std::unique_lock<std::mutex> lock(*orderInfoMutex);
+    updateIfExpired();
+
+    switch (status) {
+        case Order::BROKEN_MACHINE:
+            throw FulfillmentFailure();
+        case Order::NOT_DONE:
+            throw OrderNotReadyException();
+        case Order::EXPIRED:
+            throw OrderExpiredException();
+        case Order::RECEIVED:
+            throw BadPagerException();
+        case Order::READY: {
+            /* Zwrócenie produktów klientowi. */
+            auto result = collectReadyProducts();
+            lock.unlock();
+            notifyWorker();
+            return result;
+        }
+    }
+    throw BadPagerException();
+}
+
+void WorkerReportUpdater::updateReport(Order &order, ACTION a) {
+    switch (a) {
+        case FAIL:
+            report.failedOrders.push_back(order.getProductNames());
+            break;
+        case COLLECT:
+            report.collectedOrders.push_back(order.getProductNames());
+            break;
+        case ABANDON:
+            report.abandonedOrders.push_back(order.getProductNames());
+            break;
+    }
+    actionMade = true;
 }
 
 
-void System::closeMachines() {
-    for (auto &machine: machines) {
-        machine.second->stop();
+void OrderQueue::pushOrder(std::shared_ptr<Order> order) {
+    {
+        std::unique_lock<std::mutex> lock(queMutex);
+        que.emplace(std::move(order));
+    }
+    queCondition.notify_one();
+}
+
+std::optional<std::shared_ptr<Order>>
+OrderQueue::popOrder(std::unique_lock<std::mutex> &lock, std::atomic_bool
+&systemOpen) {
+    /* Zakładamy, że lock zostanie ustawiony przed wywołaniem funkcji. */
+    queCondition.wait(lock, [this, &systemOpen] {
+        return (!que.empty() || !systemOpen);
+    });
+    /* Jeżeli kolejka jest pusta i pracownik został obudzony, oznacza to, że
+     * nie ma już więcej pracy do wykonania. */
+    if (que.empty()) {
+        return {};
+    }
+    std::shared_ptr<Order> order(std::move(que.front()));
+    que.pop();
+
+    return order;
+}
+
+bool OrderQueue::isEmpty() {
+    std::unique_lock<std::mutex> lock(queMutex);
+    return que.empty();
+}
+
+
+void MachineQueue::pushPromise(promise_ptr value) {
+    {
+        std::unique_lock<std::mutex> lock(queMutex);
+        que.emplace(std::move(value));
+    }
+    queCondition.notify_one();
+}
+
+
+std::optional<promise_ptr> MachineQueue::popPromise(std::atomic_bool
+                                                          &orderWorkersEnded) {
+    std::unique_lock<std::mutex> lock(queMutex);
+    queCondition.wait(lock, [this, &orderWorkersEnded] {
+        return (!que.empty() || orderWorkersEnded);
+    });
+    if (orderWorkersEnded && que.empty()) {
+        return {};
+    }
+    auto promiseProduct = que.front();
+    que.pop();
+
+    return promiseProduct;
+}
+
+void MachineWrapper::machineWorker() {
+    /* Obsługa maszyny trwa do momentu, aż wszystkie wątki kompletujące
+     * zamówienia zakończą pracę. */
+    while (!orderWorkersEnded) {
+        /* Czekamy na kolejce, wyciągamy polecenie wyprodukowania
+         * produktu. */
+
+        /* Wyciągnięcie promise'u z kolejki blokującej. */
+        auto promiseProductOption = machineQueue.popPromise(orderWorkersEnded);
+
+        /* Sytuacja, w której wyszliśmy z czekania z kolejki, bo wszyscy
+         * pracownicy od zamówień skończyli pracę i nie ma już żadnej
+         * pracy do wykonania. */
+        if (!promiseProductOption.has_value() ||
+                (promiseProductOption.value() == nullptr)) {
+            break;
+        }
+
+        if (status == OFF) {
+            startMachine();
+        }
+
+        auto promiseProduct = promiseProductOption.value();
+
+        try {
+            auto p = machine->getProduct();
+            promiseProduct->set_value(std::move(p));
+
+        } catch (MachineFailure &e) {
+            promiseProduct->set_exception(std::current_exception());
+        }
+    }
+
+    if (status == ON) {
+        stopMachine();
+    }
+}
+
+
+void System::removeFromMenu(std::string &product) {
+    std::unique_lock<std::mutex> lock(menuMutex);
+    auto it = std::find(menu.begin(), menu.end(), product);
+    if (it != menu.end()) {
+        menu.erase(it);
     }
 }
 
@@ -19,102 +263,121 @@ void System::closeMachines() {
 System::System(machines_t machines,
                unsigned int numberOfWorkers,
                unsigned int clientTimeout) :
-        numberOfWorkers(numberOfWorkers),
         clientTimeout(clientTimeout),
-        closed(false),
-        machines(std::move(machines)) {
+        systemOpen(true),
+        orderWorkersEnded(false) {
 
-    initializeMachines(machines);
+    /* Przechowywanie maszyn we wrapperach. */
+    for (auto &machine: machines) {
+        this->machines.emplace(machine.first,
+                               std::make_shared<MachineWrapper>(
+                                       machine.first,
+                                       machine.second,
+                                       orderWorkersEnded));
+    }
 
+    /* Dodanie menu. */
     for (auto &machine: machines) {
         menu.emplace(machine.first);
     }
 
     for (unsigned int i = 0; i < numberOfWorkers; i++) {
-        workers.emplace_back([this]() { orderWorker(); });
+        orderWorkers.emplace_back([this]() { orderWorker(); });
     }
 }
 
 
 std::vector<WorkerReport> System::shutdown() {
-    closed = true;
+    {
+        std::unique_lock<std::mutex> orderQueueLock(orderQueue.getMutex());
+        if(!systemOpen) {
+            return workerReports;
+        }
+        systemOpen = false;
+    }
 
-    for (auto &w: workers) {
+    orderQueue.notifyShutdown();
+
+    for (auto &w: orderWorkers) {
         if (w.joinable()) {
             w.join();
         }
     }
 
-    closeMachines();
-    std::vector<WorkerReport> dailyReport;
 
-    for (auto &r: reports) {
-        dailyReport.push_back(r);
+    orderWorkersEnded = true;
+    for (auto &machine: machines) {
+        machine.second->notifyShutdown();
     }
 
-    return dailyReport;
+
+    for (auto &element: machines) {
+        element.second->joinMachineWorker();
+    }
+
+    return workerReports;
+}
+
+std::vector<std::string> System::getMenu() const {
+    std::vector<std::string> menuVector;
+    {
+        std::unique_lock<std::mutex> lock(menuMutex);
+        if (systemOpen) {
+            menuVector = std::vector<std::string>(menu.begin(), menu.end());
+        }
+    }
+    return menuVector;
 }
 
 
 std::vector<unsigned int> System::getPendingOrders() const {
-
-    std::chrono::system_clock::time_point now
-            = std::chrono::system_clock::now();
     std::vector<unsigned int> pendingOrders;
 
-    for (const auto &element: orders) {
-        auto order = element.second;
-        if (order.checkIfPending()) {
-            pendingOrders.push_back(order.getId());
+    {
+        std::unique_lock<std::mutex> lock(ordersMapMutex);
+        for (auto &element: orders) {
+            if (element.second->checkIfPending()) {
+                pendingOrders.push_back(element.second->getId());
+            }
         }
     }
+
     return pendingOrders;
 }
 
 
 std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
-    if (closed) {
+    std::unique_lock<std::mutex> newOrderLock(newOrderMutex);
+
+    if (!systemOpen) {
         throw RestaurantClosedException();
     }
 
-    if (!productsInMenu(products) || products.empty()) {
+    if (products.empty() || !productsInMenu(products)) {
         throw BadOrderException();
     }
 
     size_t newId = idGenerator.newId();
-    Order newOrder(newId, products, clientTimeout);
-    orders.emplace(newId, newOrder);
+    auto newOrder = std::make_shared<Order>(
+            Order(newId, products, clientTimeout));
+    {
+        std::unique_lock<std::mutex> ordersLock(ordersMapMutex);
+        orders.emplace(newId, newOrder);
+    }
+    orderQueue.pushOrder(newOrder);
 
-    CoasterPager newPager(newId, newOrder);
-    pagers.emplace(newId, newPager);
-
-    orderQueue.push(newOrder);
-
-    return std::make_unique<CoasterPager>(newPager);
+    return std::make_unique<CoasterPager>(CoasterPager(newOrder));
 }
 
 
 std::vector<std::unique_ptr<Product>>
-System::collectOrder(std::unique_ptr<CoasterPager> CoasterPager) {
-    auto orderStatus = CoasterPager->getOrder().getStatus();
-    switch (orderStatus) {
-        case Order::BROKEN_MACHINE: {
-            throw FulfillmentFailure();
-        }
-        case Order::NOT_DONE: {
-            throw OrderNotReadyException();
-        }
-        case Order::EXPIRED: {
-            throw OrderExpiredException();
-        }
-        case Order::RECEIVED: {
-            throw BadPagerException();
-        }
-        case Order::READY: {
-            // Przypadki brzegowe itp.
-            // zwrócenie produktu
-            return {};
-        }
+System::collectOrder(std::unique_ptr<CoasterPager> pager) {
+
+    std::unique_lock<std::mutex> collectLock(collectOrderMutex);
+    try {
+        return pager->order->tryToCollectOrder();
+    } catch (...) {
+        throw;
     }
 }
 
@@ -129,46 +392,90 @@ bool System::productsInMenu(std::vector<std::string> &products) {
 }
 
 
-void CoasterPager::wait() const {
-
-}
-
-
-void CoasterPager::wait(unsigned int timeout) const {
-
-}
-
 void System::orderWorker() {
-    while (!closed) {
-        Order order = orderQueue.popOrder(mSynchronizer);
+    WorkerReportUpdater infoUpdater;
+
+    /* Pracownik wykonuje pracę, dopóki system nie zamknie się i kolejka nie
+     * będzie pusta. */
+    while (systemOpen || !orderQueue.isEmpty()) {
+
+        /* Zablokowanie kolejki zamówień. */
+        std::unique_lock<std::mutex> lock(orderQueue.getMutex());
+
+
+        /* Odebranie zamówienia z kolejki blokującej. */
+        auto orderOption = orderQueue.popOrder(lock, systemOpen);
+
+        /* Sytuacja zamknięcia systemu. */
+        if (!orderOption.has_value()) {
+            lock.unlock();
+            break;
+        }
+
+        auto order = orderOption->get();
+
+        /* Zlecenie maszynom wyprodukowanie produktów. */
+        std::vector<std::pair<std::string, product_future_t>> futureProducts;
+
+        {
+            std::unique_lock<std::mutex> orderMutex(*(order->getInfoMutex()));
+
+            for (const auto &productName: order->getProductNames()) {
+                auto newPromise = std::make_shared<product_promise_t>();
+
+                futureProducts.emplace_back(productName, newPromise->get_future());
+                machines.at(productName)->insertToQueue(std::move(newPromise));
+            }
+        }
+
+        /* Odblokowanie kolejki zamówień. */
+        lock.unlock();
+
+        /* Wyprodukowane produkty przez maszyny. */
         std::vector<std::pair<std::string, std::unique_ptr<Product>>>
-                doneProducts;
+                readyProducts;
 
-//        for (auto &product: order.getProducts()) {
-//            auto machine = machines.find(product);
-//            if (machine != machines.end()) {
-//                try {
-//                    std::unique_ptr<Product> newProduct = mSynchronizer
-//                            .waitAndGetProduct(order.getId(),
-//                                                    machine->first,
-//                                                    machine->second);
-//                    doneProducts.emplace_back(machine->first, std::move(newProduct));
-//                } catch (MachineFailure &e) {
-//                    // zwrócenie produktów
-//
-//                }
-//
-//            } else {
-//                mSynchronizer.returnProducts(order.getId(), machines,
-//                                             doneProducts);
-//                order.setStatus(Order::NOT_FOUND);
-//            }
-//        }
+        for (auto &futureProduct: futureProducts) {
+            std::string productName = futureProduct.first;
+            try {
+                auto product = futureProduct.second.get();
 
+                /* Jeżeli wyprodukowanie powiodło się, dodanie do kontenera.*/
+                readyProducts.emplace_back(productName, std::move(product));
+
+            } catch (MachineFailure &e) {
+                removeFromMenu(productName);
+                /* W przypadku awarii maszyny, zaznaczenie informacji. */
+                order->setStatusLocked(Order::BROKEN_MACHINE);
+                order->notifyClient();
+                infoUpdater.updateReport(productName);
+            }
+        }
+
+        std::unique_lock<std::mutex> orderLock(*(order->getInfoMutex()));
+
+        if (order->getStatus() == Order::BROKEN_MACHINE) {
+            infoUpdater.updateReport(*order, WorkerReportUpdater::FAIL);
+            /* Zwrócenie niewykorzystanych produktów do odpowiednich maszyn. */
+            order->returnProducts(machines);
+            orderLock.unlock();
+            order->notifyClient();
+
+        } else {
+            order->markOrderDone(readyProducts);
+
+            orderLock.unlock();
+            /* Powiadomienie klienta czekającego na funkcjach z pager'a. */
+            order->notifyClient();
+
+            order->waitForClient(infoUpdater, machines);
+        }
+    }
+
+    {
+        std::unique_lock<std::mutex> workerReportsLock(workerReportsMutex);
+        infoUpdater.addReport(workerReports);
     }
 }
 
-void System::machineWorker() {
-
-}
 

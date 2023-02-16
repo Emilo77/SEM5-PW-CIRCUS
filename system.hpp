@@ -2,6 +2,7 @@
 #define SYSTEM_HPP
 
 #include <exception>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <functional>
@@ -11,14 +12,13 @@
 #include <deque>
 #include <optional>
 #include <map>
+#include <queue>
 
 #include "machine.hpp"
 
-enum MachineStatus {
-    OFF,
-    ON,
-    BROKEN
-};
+typedef std::promise<std::unique_ptr<Product>> product_promise_t;
+typedef std::future<std::unique_ptr<Product>> product_future_t;
+typedef std::shared_ptr<product_promise_t> promise_ptr;
 
 class FulfillmentFailure : public std::exception {
 };
@@ -38,6 +38,110 @@ class OrderExpiredException : public std::exception {
 class RestaurantClosedException : public std::exception {
 };
 
+class WorkerReportUpdater;
+
+class MachineWrapper;
+
+/* Klasa reprezentująca zamówienia. */
+class Order {
+public:
+    /* Możliwy status zamówienia. */
+    enum OrderStatus {
+        NOT_DONE,
+        BROKEN_MACHINE,
+        READY,
+        RECEIVED,
+        EXPIRED,
+    };
+private:
+    typedef std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> machine_wrappers_t;
+    size_t id;
+    unsigned int timeout;
+    std::vector<std::string> products;
+    OrderStatus status;
+    std::chrono::time_point<std::chrono::system_clock> doneTime;
+    std::shared_ptr<std::mutex> orderInfoMutex;
+    std::shared_ptr<std::condition_variable> clientNotifier;
+    std::shared_ptr<std::condition_variable> workerNotifier;
+    std::vector<std::pair<std::string, std::unique_ptr<Product>>> readyProducts;
+public:
+    Order(size_t id,
+          std::vector<std::string> &products,
+          unsigned int timeout) :
+            id(id),
+            timeout(timeout),
+            products(products),
+            status(NOT_DONE),
+            orderInfoMutex(std::make_shared<std::mutex>()),
+            clientNotifier(std::make_shared<std::condition_variable>()),
+            workerNotifier(std::make_shared<std::condition_variable>()) {}
+
+    /* Funkcja wywoływana po stronie klienta.
+     * Blokuje do czasu zmienienia statusu zamówienia. */
+    void waitForOrder();
+
+    /* Analogiczna funkcja jak wyżej, blokująca maksymalnie na x czasu. */
+    void waitForOrderTimed(unsigned int time);
+
+    /* Funkcja wywoływana po stronie pracownika.
+     * Blokuje pracownika na maksymalnie timeout, w tym czasie klient
+     * powinien odebrać swoje zamówienie. */
+    void waitForClient(WorkerReportUpdater &infoUpdater, machine_wrappers_t
+    &machines);
+
+    /* Funkcja po stronie pracownika, oznaczenie zamówienia jako gotowe. */
+    void markOrderDone(std::vector<std::pair<std::string,
+            std::unique_ptr<Product>>> &namedProducts);
+
+    /* Funkcja po stronie klienta do odebrania gotowego zamówienia. */
+    std::vector<std::unique_ptr<Product>> collectReadyProducts();
+
+    /* Powiadomienie pracownika. */
+    void notifyWorker() { workerNotifier->notify_one(); }
+
+    /* Powiadomienie klienta. */
+    void notifyClient() { clientNotifier->notify_one(); }
+
+    /* Funkcja po stronie klienta do odebrania zamówienia, z możliwością
+     * rzucenia wyjątków. */
+    std::vector<std::unique_ptr<Product>> tryToCollectOrder();
+
+    /* Funkcja po stronie pracownika, zwraca stworzone produkty do
+     * maszyn w przypadku awarii zamówienia.  */
+    void returnProducts(machine_wrappers_t &machines);
+
+    /* Zwrócenie id. */
+    [[nodiscard]] size_t getId() const { return id; }
+
+    /* Sprawdzenie, czy zamówienie jest gotowe. */
+    [[nodiscard]] bool isReady();
+
+    /* Funkcja zwracająca wszystkie nazwy produktów w zamówieniu. */
+    [[nodiscard]] std::vector<std::string> getProductNames();
+
+    /* Funkcja sprawdzająca, czy upłynął czas na odebranie zamówienia przez
+     * klienta. Jeśli tak, aktualizuje status. */
+    void updateIfExpired();
+
+    /* Funkcja sprawdzająca, czy zamówienie powinno zostać zwrócone w
+     * przypadku wywołania getPendingOrders(). */
+    bool checkIfPending();
+
+    /* Zwrócenie statusu. */
+    OrderStatus getStatus();
+
+    /* Ustawienie statusu.*/
+    void setStatus(OrderStatus newStatus) { status = newStatus; }
+
+    /* Ustawienie statusu pod mutexem ochrony zmiennych. */
+    void setStatusLocked(OrderStatus newStatus);
+
+    /* Zwrócenie mutexu ochrony zmiennych. */
+    std::shared_ptr<std::mutex> getInfoMutex() { return orderInfoMutex; }
+};
+
+
 struct WorkerReport {
     std::vector<std::vector<std::string>> collectedOrders;
     std::vector<std::vector<std::string>> abandonedOrders;
@@ -45,288 +149,239 @@ struct WorkerReport {
     std::vector<std::string> failedProducts;
 };
 
-class Order {
+/* Klasa pomocnicza do aktualizowania raportów pracownika. */
+class WorkerReportUpdater {
+private:
+    struct WorkerReport report;
+    bool actionMade{false};
 public:
-    enum OrderStatus {
-        NOT_DONE,
-        BROKEN_MACHINE,
-        READY,
-        RECEIVED,
-        EXPIRED,
-        NOT_FOUND
+    enum ACTION {
+        FAIL,
+        COLLECT,
+        ABANDON
+    };
+
+    /* Funkcje aktualizujące raport. */
+    void updateReport(Order &order, ACTION a);
+
+    void updateReport(std::string &product) {
+        report.failedProducts.push_back(product);
+        actionMade = true;
+    }
+
+    /* Umieszczenie raportu do kontenera wszystkich raportów. */
+    void addReport(std::vector<WorkerReport> &workerReports) {
+        if (actionMade) {
+            workerReports.push_back(report);
+        }
+    }
+};
+
+/* Kolejka blokująca na zamówienia. W przypadku pustej kolejki, wątki
+ * reprezentujące pracowników śpią na zmiennej warunkowej. Wrzucenie nowego
+ * zamówienia do kolejki powoduje obudzenie lub brak blokowania wątku
+ * pracownika. */
+class OrderQueue {
+private:
+    std::mutex queMutex;
+    std::condition_variable queCondition;
+    std::queue<std::shared_ptr<Order>> que;
+public:
+    /* Umieszczenie zamówienia w kolejce. */
+    void pushOrder(std::shared_ptr<Order> value);
+
+    /* Możliwe wyciągnięcie zamówienia z kolejki. W przypadku zamknięcia
+     * systemu wątki zostają obudzone i opuszczają funkcję bez zamówienia. */
+    std::optional<std::shared_ptr<Order>>
+    popOrder(std::unique_lock<std::mutex> &lock,
+             std::atomic_bool &systemOpen);
+
+    /*Sprawdzenie, czy kolejka jest pusta.*/
+    bool isEmpty();
+
+    /* Powiadomienie pracowników o zamknięciu systemu. */
+    void notifyShutdown() { queCondition.notify_all(); }
+
+    /* Zwrócenie mutexu na kolejkę. */
+    std::mutex &getMutex() { return queMutex; }
+};
+
+/* Kolejka blokująca na zlecenia wyprodukowania produktu w maszynie.
+ * Analogiczna jak wyżej.
+ * Kolejka przechowuje wskaźniki na promisy, przez które maszyna przekazuje
+ * gotowy produkt.  */
+class MachineQueue {
+private:
+    std::mutex queMutex;
+    std::condition_variable queCondition;
+    std::queue<promise_ptr> que;
+public:
+    /* Umieszczenie wskaźnika na promise w kolejce. */
+    void pushPromise(promise_ptr value);
+
+    /* Wyciągnięcie promise'u z kolejki. */
+    std::optional<promise_ptr> popPromise(std::atomic_bool &ended);
+
+    /* Powiadomienie wszystkich wątków czekających na kolejce. */
+    void notify() { queCondition.notify_all(); }
+};
+
+/* Klasa pomocnicza dla maszyny. Każda maszyna posiada wątek pomocniczy, który czeka
+ * na kolejce blokującej, odbiera z niej zlecenia i wytwarza produkt. */
+class MachineWrapper {
+public:
+    /* Informacja o stanie maszyny. */
+    enum MachineStatus {
+        OFF,
+        ON,
     };
 private:
-    size_t id;
-    vector <std::string> products;
-    unsigned int timeout;
-    OrderStatus status;
-    std::mutex &mutex;
-    std::chrono::time_point<std::chrono::system_clock> doneTime;
+    std::string machineName;
+    std::shared_ptr<Machine> machine;
+    MachineStatus status;
+    MachineQueue machineQueue;
+    std::thread worker;
+    std::atomic_bool &orderWorkersEnded;
+    std::mutex returnProductMutex;
 public:
-    explicit Order(unsigned int id,
-                   vector <std::string> &products,
-                   unsigned int timeout,
-                   std::mutex &mutex) :
-            id(id),
-            products(products),
-            timeout(timeout),
-            status(NOT_DONE),
-            mutex(mutex) {}
-
-    void markDone() {
-        std::unique_lock<std::mutex> lock(mutex);
-        doneTime = std::chrono::system_clock::now();
-        status = READY;
+    /* Konstruktor rozpoczyna pracę wątku obsługującego maszynę. */
+    MachineWrapper(std::string machineName,
+                   std::shared_ptr<Machine> &machine,
+                   std::atomic_bool &orderWorkersEnded) :
+            machineName(std::move(machineName)),
+            machine(std::move(machine)),
+            status(OFF),
+            orderWorkersEnded(orderWorkersEnded) {
+        worker = std::thread([this] { machineWorker(); });
     }
 
-    [[nodiscard]] size_t getId() const {
-        std::unique_lock<std::mutex> lock(mutex);
-        return id;
+    /* Umieszczenie promise'u do kolejki. */
+    void insertToQueue(promise_ptr promise) {
+        machineQueue.pushPromise(std::move(promise));
     }
 
-    [[nodiscard]] vector <std::string> getProducts() const {
-        std::unique_lock<std::mutex> lock(mutex);
-        return products;
+    /* Zwrócenie produktu z nieudanego zamówienia z powrotem do maszyny.
+     * W tym samym czasie może zostać zwracany tylko jeden produkt. */
+    void returnProduct(std::unique_ptr<Product> &product) {
+        std::unique_lock<std::mutex> lock(returnProductMutex);
+        machine->returnProduct(std::move(product));
     }
 
-    [[nodiscard]] bool isReady() const {
-        std::unique_lock<std::mutex> lock(mutex);
-        return status == READY;
-    }
+    /* Powiadomienie pracowników maszyn o zamknięciu systemu. */
+    void notifyShutdown() { machineQueue.notify(); }
 
-    void checkIfExpired() {
-        if (status == READY) {
-            std::chrono::duration<double> elapsedTime =
-                    std::chrono::system_clock::now() - doneTime;
-            if (elapsedTime > std::chrono::milliseconds(timeout)) {
-                status = EXPIRED;
-            }
+    /* Czekanie na koniec pracy wątków maszyn.  */
+    void joinMachineWorker() {
+        if (worker.joinable()) {
+            worker.join();
         }
     }
 
-    bool checkIfPending() {
-        std::unique_lock<std::mutex> lock(mutex);
-        checkIfExpired();
-
-        if (status == READY) {
-            return true;
-        }
-        return false;
-    }
-
-    OrderStatus getStatus() {
-        std::unique_lock<std::mutex> lock(mutex);
-        checkIfExpired();
-
-        return status;
-    }
-};
-
-class MachinesSynchronizer;
-
-
-template<typename T>
-class BlockingQueue {
 private:
-    std::mutex d_mutex;
-    std::condition_variable d_condition;
-    std::deque<T> d_queue;
-public:
-    void push(T const &value) {
-        {
-            std::unique_lock<std::mutex> lock(d_mutex);
-            d_queue.push_front(value);
-        }
-        d_condition.notify_one();
+    /* Włączenie maszyny. */
+    void startMachine() {
+        machine->start();
+        status = ON;
     }
 
-    T popOrder(MachinesSynchronizer &sync) {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_condition.wait(lock, [=] { return !d_queue.empty(); });
-        T order(std::move(d_queue.back()));
-        d_queue.pop_back();
-
-        sync.insertOrder(order);
-
-        return order;
+    /* Wyłączenie maszyny. */
+    void stopMachine() {
+        machine->stop();
+        status = OFF;
     }
 
-    T popId() {
-        std::unique_lock<std::mutex> lock(d_mutex);
-        d_condition.wait(lock, [=] { return !d_queue.empty(); });
-        T id(std::move(d_queue.back()));
-        d_queue.pop_back();
-
-        return id;
-    }
+    /* Funkcja obsługująca pracę wątku pomocniczego. */
+    void machineWorker();
 };
 
-class MachinesSynchronizer {
-private:
-    std::unordered_map<std::string, std::deque<size_t>> ques; //tu zamienić
-    // na blocking queue
-    std::condition_variable condition;
-    std::mutex mutex;
-public:
-    void initialize(const std::unordered_map<std::string,
-            std::shared_ptr<Machine>> &machines) {
-        std::unique_lock<std::mutex> lock(mutex);
-        for (auto &machine: machines) {
-            ques.emplace(machine.first, std::deque<size_t>());
-        }
-    }
-
-    void insertOrder(Order &order) {
-        std::unique_lock<std::mutex> lock(mutex);
-        for (const auto &product: order.getProducts()) {
-            if (ques.count(product))
-                ques.at(product).push_front(order.getId());
-            else {
-                cout << "insertOrder: product "
-                     << product << " not found in any machine\n";
-                exit(1);
-            }
-        }
-    }
-
-    std::unique_ptr<Product> waitAndGetProduct(size_t orderId,
-                           const std::string &productStr,
-                           const std::shared_ptr<Machine> &machine) {
-        std::unique_lock<std::mutex> lock(mutex);
-        condition.wait(lock,
-                       [=] { return ques.at(productStr).back() == orderId; });
-        try {
-            lock.unlock();
-            unique_ptr <Product> product = machine->getProduct();
-            lock.lock();
-
-            ques.at(productStr).pop_back();
-            condition.notify_one();
-
-            return product;
-
-        } catch (const MachineFailure &e) {
-            throw e;
-        }
-    }
-
-    void removeOrder(size_t orderId) {
-        for (auto &que: ques) {
-            while (!que.second.empty()) {
-                for(auto it = que.second.begin(); it != que.second.end(); ++it)
-                    if (*it == orderId)
-                        que.second.erase(it);
-            }
-        }
-    }
-
-    void returnProducts(size_t orderId,
-                        const std::unordered_map<std::string,
-                        std::shared_ptr<Machine>> &machines,
-                        std::vector<std::pair<std::string,
-                        std::unique_ptr<Product>>>  &doneProducts) {
-
-        std::unique_lock<std::mutex> lock(mutex);
-        for (auto &pair: doneProducts) {
-            std::string productStr = pair.first;
-            auto product = std::move(pair.second);
-            //todo może trzeba maszynę opakować mutexem
-            machines.at(productStr)->returnProduct(std::move(product));
-        }
-
-        removeOrder(orderId);
-    }
-};
-
-
-
-
+/* Klasa reprezentująca pager. */
 class CoasterPager {
+    friend class System;
+
 private:
-    size_t currentId;
-    Order order;
+    /* Pager posiada wskaźnik na swoje zamówienie. */
+    std::shared_ptr<Order> order;
+
+    explicit CoasterPager(std::shared_ptr<Order> order) : order(
+            std::move(order)) {}
+
 public:
-    CoasterPager(size_t id, Order &order) :
-            currentId(id),
-            order(order) {}
+    void wait() const { order->waitForOrder(); }
 
-    // todo zmienić widoczność konstruktora i getOrder na prywatne
-    Order getOrder() { return order; }
+    void wait(unsigned int timeout) const { order->waitForOrderTimed(timeout); }
 
-    void wait() const;
+    [[nodiscard]] unsigned int getId() const { return order->getId(); };
 
-    void wait(unsigned int timeout) const;
-
-    [[nodiscard]] unsigned int getId() const { return currentId; };
-
-    [[nodiscard]] bool isReady() const { return order.isReady(); };
+    [[nodiscard]] bool isReady() const { return order->isReady(); };
 };
 
+/* Główna klasa reprezentująca system restauracji. */
 class System {
+    typedef std::unordered_map<std::string,
+            std::shared_ptr<MachineWrapper>> machine_wrappers_t;
 private:
+    /* Generator id zamówienia. */
     class IdGenerator {
         size_t id{1};
     public:
         size_t newId() { return id++; }
     };
+    IdGenerator idGenerator;
+    unsigned int clientTimeout;
+    std::atomic_bool systemOpen;
+
+    machine_wrappers_t machines;
+
+    std::set<std::string> menu;
+    mutable std::mutex menuMutex;
+
+    std::map<size_t, std::shared_ptr<Order>> orders;
+    mutable std::mutex ordersMapMutex;
+    mutable std::mutex newOrderMutex;
+    mutable std::mutex collectOrderMutex;
+    OrderQueue orderQueue;
+
+    std::vector<std::thread> orderWorkers;
+    mutable std::mutex workerReportsMutex;
+    std::vector<WorkerReport> workerReports;
+    std::atomic_bool orderWorkersEnded;
+
+    /* Sprawdza, czy dany produkt znajduje się w menu. */
+    bool productsInMenu(std::vector<std::string> &products);
+
+    /* Usuwa pozycję z menu. */
+    void removeFromMenu(std::string &product);
+
+    /* Funkcja pracownika kompletującego zamówienia. */
+    void orderWorker();
 
 public:
     typedef std::unordered_map<std::string, std::shared_ptr<Machine>> machines_t;
-private:
-    unsigned int numberOfWorkers;
-    unsigned int clientTimeout;
-
-    IdGenerator idGenerator;
-    std::map<size_t, Order> orders;
-    BlockingQueue<Order> orderQueue;
-    std::map<size_t, CoasterPager> pagers;
-
-    std::atomic_bool closed;
-
-    std::set<std::string> menu;
-    std::mutex menuMutex;
-
-    machines_t machines;
-    std::unordered_map<std::string, MachineStatus> machineStatus;
-    MachinesSynchronizer mSynchronizer;
-
-    std::vector<std::thread> workers;
-    std::vector<struct WorkerReport> reports;
-
-    std::mutex shutdown_mutex;
-
-public:
+    /* Konstruktor systemu. Opakowuje maszyny we wrappery, uruchamia wątki
+     * pracowników, obsługujących zamówienia. */
     System(machines_t machines, unsigned int numberOfWorkers,
            unsigned int clientTimeout);
 
-    void informClosed();
-
+    /* Zamknięcie systemu. Zakładamy, że ta funkcja musi zostać wywołana
+     * na koniec działania programu. */
     std::vector<WorkerReport> shutdown();
 
-    std::vector<std::string> getMenu() const {
-        return closed ? vector<string>() : vector<string>(menu.begin(),
-                                                          menu.end());
-    }
+    /* Zwraca menu. */
+    std::vector<std::string> getMenu() const;
 
+    /* Zwraca zamówienia w realizacji. */
     std::vector<unsigned int> getPendingOrders() const;
 
+    /* Składa nowe zamówienie. */
     std::unique_ptr<CoasterPager> order(std::vector<std::string> products);
 
+    /* Odbiera gotowe zamówienie, w przypadku awarii zwraca wyjątek. */
     std::vector<std::unique_ptr<Product>>
     collectOrder(std::unique_ptr<CoasterPager> CoasterPager);
 
+    /* Zwraca maksymalny czas, w jakim można odebrać gotowe zamówienie. */
     unsigned int getClientTimeout() const { return clientTimeout; }
 
-    bool productsInMenu(std::vector<string> &products);
-
-private:
-    void initializeMachines(machines_t &machines);
-
-    void closeMachines();
-
-    void orderWorker();
-
-    void machineWorker();
 };
 
 

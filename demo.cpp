@@ -6,6 +6,13 @@
 
 #include "system.hpp"
 
+std::mutex printMutex;
+void print(std::string s) {
+    std::unique_lock<std::mutex> lock(printMutex);
+    std::cout << std::this_thread::get_id() << ": " << s << std::endl;
+}
+
+
 template <typename T, typename V>
 bool checkType(const V* v) {
     return dynamic_cast<const T*>(v) != nullptr;
@@ -93,7 +100,7 @@ public:
         cond.wait(lock, [this](){ return !queue.empty(); });
         wcount--;
         auto product = std::move(queue.front());
-        queue.pop_back();
+        queue.pop_front();
         return product;
     }
 
@@ -141,15 +148,17 @@ int main() {
                     {"chips", std::shared_ptr<Machine>(new ChipsMachine())},
             },
             10,
-            1
+            100
     };
 
     auto client1 = std::thread([&system]() {
         system.getMenu();
         auto p = system.order({"burger", "chips"});
+        print("clien1 rozpoczyna czekanie");
         p->wait();
+        print("clien1 kończy czekanie");
         system.collectOrder(std::move(p));
-        std::cout << "OK\n";
+        std::cout << "OK 1\n";
     });
 
     auto client2 = std::thread([&system](){
@@ -157,10 +166,12 @@ int main() {
         system.getPendingOrders();
         try {
             auto p = system.order({"iceCream", "chips"});
+            print("clien2 rozpoczyna czekanie");
             p->wait();
+            print("clien2 kończy czekanie");
             system.collectOrder(std::move(p));
         } catch (const FulfillmentFailure& e) {
-            std::cout << "OK\n";
+            std::cout << "OK 2\n";
         }
     });
 
@@ -178,8 +189,22 @@ int main() {
             p->wait();
             system.collectOrder(std::move(p));
         } catch (const RestaurantClosedException& e) {
-            std::cout << "OK\n";
+            std::cout << "OK 3\n";
         }
     });
     client3.join();
 }
+
+//int main() {
+//    System system{
+//            {
+//                    {"burger", std::shared_ptr<Machine>(new BurgerMachine())},
+//                    {"iceCream",
+//                     std::shared_ptr<Machine>(new IceCreamMachine())},
+//                    {"chips", std::shared_ptr<Machine>(new ChipsMachine())},
+//            },
+//            10,
+//            100
+//    };
+//    system.shutdown();
+//}
