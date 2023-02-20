@@ -321,7 +321,7 @@ std::vector<std::string> System::getMenu() const {
     std::vector<std::string> menuVector;
     {
         std::unique_lock<std::mutex> lock(menuMutex);
-        if (systemOpen) {
+        if (systemOpen && !orderWorkers.empty()) {
             menuVector = std::vector<std::string>(menu.begin(), menu.end());
         }
     }
@@ -348,7 +348,7 @@ std::vector<unsigned int> System::getPendingOrders() const {
 std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
     std::unique_lock<std::mutex> newOrderLock(newOrderMutex);
 
-    if (!systemOpen) {
+    if (!systemOpen || orderWorkers.empty()) {
         throw RestaurantClosedException();
     }
 
