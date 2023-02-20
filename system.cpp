@@ -152,7 +152,6 @@ void WorkerReportUpdater::updateReport(Order &order, ACTION a) {
             report.abandonedOrders.push_back(order.getProductNames());
             break;
     }
-    actionMade = true;
 }
 
 
@@ -372,8 +371,10 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
 
 std::vector<std::unique_ptr<Product>>
 System::collectOrder(std::unique_ptr<CoasterPager> pager) {
+    if (pager == nullptr) {
+        throw BadPagerException();
+    }
 
-    std::unique_lock<std::mutex> collectLock(collectOrderMutex);
     try {
         return pager->order->tryToCollectOrder();
     } catch (...) {
