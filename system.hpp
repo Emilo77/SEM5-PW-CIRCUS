@@ -153,7 +153,6 @@ struct WorkerReport {
 class WorkerReportUpdater {
 private:
     struct WorkerReport report;
-    bool actionMade{false};
 public:
     enum ACTION {
         FAIL,
@@ -166,14 +165,11 @@ public:
 
     void updateReport(std::string &product) {
         report.failedProducts.push_back(product);
-        actionMade = true;
     }
 
     /* Umieszczenie raportu do kontenera wszystkich raportów. */
     void addReport(std::vector<WorkerReport> &workerReports) {
-        if (actionMade) {
-            workerReports.push_back(report);
-        }
+        workerReports.push_back(report);
     }
 };
 
@@ -338,7 +334,6 @@ private:
     std::map<size_t, std::shared_ptr<Order>> orders;
     mutable std::mutex ordersMapMutex;
     mutable std::mutex newOrderMutex;
-    mutable std::mutex collectOrderMutex;
     OrderQueue orderQueue;
 
     std::vector<std::thread> orderWorkers;

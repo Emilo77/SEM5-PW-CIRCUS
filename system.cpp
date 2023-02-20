@@ -152,7 +152,6 @@ void WorkerReportUpdater::updateReport(Order &order, ACTION a) {
             report.abandonedOrders.push_back(order.getProductNames());
             break;
     }
-    actionMade = true;
 }
 
 
@@ -322,7 +321,7 @@ std::vector<std::string> System::getMenu() const {
     std::vector<std::string> menuVector;
     {
         std::unique_lock<std::mutex> lock(menuMutex);
-        if (systemOpen) {
+        if (systemOpen && !orderWorkers.empty()) {
             menuVector = std::vector<std::string>(menu.begin(), menu.end());
         }
     }
@@ -349,7 +348,7 @@ std::vector<unsigned int> System::getPendingOrders() const {
 std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
     std::unique_lock<std::mutex> newOrderLock(newOrderMutex);
 
-    if (!systemOpen) {
+    if (!systemOpen || orderWorkers.empty()) {
         throw RestaurantClosedException();
     }
 
@@ -372,8 +371,10 @@ std::unique_ptr<CoasterPager> System::order(std::vector<std::string> products) {
 
 std::vector<std::unique_ptr<Product>>
 System::collectOrder(std::unique_ptr<CoasterPager> pager) {
+    if (pager == nullptr) {
+        throw BadPagerException();
+    }
 
-    std::unique_lock<std::mutex> collectLock(collectOrderMutex);
     try {
         return pager->order->tryToCollectOrder();
     } catch (...) {
