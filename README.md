@@ -193,13 +193,23 @@ i zawierać pliki: `system.hpp` i `system.cpp`.
 Plik `system.hpp` można dowolnie modyfikować, nie zmieniając jednak publicznych interfejsów klas i
 struktur.
 
-## Pytania
-
-Pytania prosimy zadawać na forum.
-
 ### Dostarczone pliki
+Do projektu zostały dołączone pliki:
+<details><summary>:pushpin: Rozwiń </summary>
+<p>
 
 - [demo.cpp](demo.cpp)
 - [demo.hpp](demo.hpp)
 - [system.cpp](system.cpp)
 - [system.hpp](system.hpp)
+
+</p>
+</details>
+
+---
+
+## Pytania
+
+Pytania prosimy zadawać na forum.
+
+
